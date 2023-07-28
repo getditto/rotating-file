@@ -4,15 +4,16 @@
 //!
 //! ```
 //! use rotating_file::RotatingFile;
+//! use std::io::Write;
 //!
 //! let root_dir = "./target/tmp";
 //! let s = "The quick brown fox jumps over the lazy dog";
 //! let _ = std::fs::remove_dir_all(root_dir);
 //!
 //! // rotated by 1 kilobyte, compressed with gzip
-//! let rotating_file = RotatingFile::new(root_dir, Some(1), None, None, None, None, None);
+//! let mut rotating_file = RotatingFile::new(root_dir, Some(1), None, None, None, None, None);
 //! for _ in 0..24 {
-//!     rotating_file.writeln(s).unwrap();
+//!     writeln!(rotating_file, "{}", s).unwrap();
 //! }
 //! rotating_file.close();
 //!
@@ -119,51 +120,6 @@ impl RotatingFile {
             context: Mutex::new(context),
             handles: Arc::new(Mutex::new(Vec::new())),
         }
-    }
-
-    pub fn writeln(&self, s: &str) -> Result<(), Error> {
-        let mut guard = self.context.lock().unwrap();
-
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        if (self.size > 0 && guard.total_written + s.len() + 1 >= self.size * 1024)
-            || (self.interval > 0 && now >= (guard.timestamp + self.interval))
-        {
-            guard.file.flush()?;
-            guard.file.get_ref().sync_all()?;
-            let old_file = guard.file_path.clone();
-
-            // reset context
-            *guard = Self::create_context(
-                self.interval,
-                self.root_dir.as_str(),
-                self.date_format.as_str(),
-                self.prefix.as_str(),
-                self.suffix.as_str(),
-            );
-
-            // compress in a background thread
-            if let Some(c) = self.compression {
-                let handles_clone = self.handles.clone();
-                let handle = std::thread::spawn(move || Self::compress(old_file, c, handles_clone));
-                self.handles.lock().unwrap().push(handle);
-            }
-        }
-
-        if let Err(e) = writeln!(&mut guard.file, "{}", s) {
-            error!(
-                "Failed to write to file {}: {}",
-                guard.file_path.to_str().unwrap(),
-                e
-            );
-        } else {
-            guard.total_written += s.len() + 1;
-        }
-
-        Ok(())
     }
 
     pub fn close(&self) {
@@ -287,6 +243,61 @@ impl RotatingFile {
     }
 }
 
+impl Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut guard = self.context.lock().unwrap();
+
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+
+        if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
+            || (self.interval > 0 && now >= (guard.timestamp + self.interval))
+        {
+            guard.file.flush()?;
+            guard.file.get_ref().sync_all()?;
+            let old_file = guard.file_path.clone();
+
+            // reset context
+            *guard = Self::create_context(
+                self.interval,
+                self.root_dir.as_str(),
+                self.date_format.as_str(),
+                self.prefix.as_str(),
+                self.suffix.as_str(),
+            );
+
+            // compress in a background thread
+            if let Some(c) = self.compression {
+                let handles_clone = self.handles.clone();
+                let handle = std::thread::spawn(move || Self::compress(old_file, c, handles_clone));
+                self.handles.lock().unwrap().push(handle);
+            }
+        }
+
+        match guard.file.write(buf) {
+            Ok(written) => {
+                guard.total_written += written;
+                Ok(written)
+            }
+            Err(e) => {
+                error!(
+                    "Failed to write to file {}: {}",
+                    guard.file_path.to_str().unwrap(),
+                    e
+                );
+                Err(e)
+            }
+        }
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        let mut guard = self.context.lock().unwrap();
+        guard.file.flush()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -294,6 +305,7 @@ mod tests {
     use std::path::Path;
     use std::time::Duration;
     use std::time::SystemTime;
+    use std::{io::Write, sync::Mutex};
 
     const TEXT: &'static str = "The quick brown fox jumps over the lazy dog";
 
@@ -302,11 +314,11 @@ mod tests {
         let root_dir = "./target/tmp1";
         let _ = std::fs::remove_dir_all(root_dir);
         let timestamp = current_timestamp_str();
-        let rotating_file =
+        let mut rotating_file =
             super::RotatingFile::new(root_dir, Some(1), None, None, None, None, None);
 
         for _ in 0..23 {
-            rotating_file.writeln(TEXT).unwrap();
+            writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
         rotating_file.close();
@@ -321,11 +333,11 @@ mod tests {
         std::fs::remove_dir_all(root_dir).unwrap();
 
         let timestamp = current_timestamp_str();
-        let rotating_file =
+        let mut rotating_file =
             super::RotatingFile::new(root_dir, Some(1), None, None, None, None, None);
 
         for _ in 0..24 {
-            rotating_file.writeln(TEXT).unwrap();
+            writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
         rotating_file.close();
@@ -348,16 +360,16 @@ mod tests {
     fn rotate_by_time() {
         let root_dir = "./target/tmp2";
         let _ = std::fs::remove_dir_all(root_dir);
-        let rotating_file =
+        let mut rotating_file =
             super::RotatingFile::new(root_dir, None, Some(1), None, None, None, None);
 
         let timestamp1 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         std::thread::sleep(Duration::from_secs(1));
 
         let timestamp2 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close();
 
@@ -372,7 +384,7 @@ mod tests {
         let root_dir = "./target/tmp3";
         let _ = std::fs::remove_dir_all(root_dir);
         let timestamp = current_timestamp_str();
-        let rotating_file = super::RotatingFile::new(
+        let mut rotating_file = super::RotatingFile::new(
             root_dir,
             Some(1),
             None,
@@ -383,7 +395,7 @@ mod tests {
         );
 
         for _ in 0..24 {
-            rotating_file.writeln(TEXT).unwrap();
+            writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
         rotating_file.close();
@@ -401,7 +413,7 @@ mod tests {
         let root_dir = "./target/tmp4";
         let _ = std::fs::remove_dir_all(root_dir);
         let timestamp = current_timestamp_str();
-        let rotating_file = super::RotatingFile::new(
+        let mut rotating_file = super::RotatingFile::new(
             root_dir,
             Some(1),
             None,
@@ -412,7 +424,7 @@ mod tests {
         );
 
         for _ in 0..24 {
-            rotating_file.writeln(TEXT).unwrap();
+            writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
         rotating_file.close();
@@ -429,7 +441,7 @@ mod tests {
     fn rotate_by_time_and_gzip() {
         let root_dir = "./target/tmp5";
         let _ = std::fs::remove_dir_all(root_dir);
-        let rotating_file = super::RotatingFile::new(
+        let mut rotating_file = super::RotatingFile::new(
             root_dir,
             None,
             Some(1),
@@ -440,12 +452,12 @@ mod tests {
         );
 
         let timestamp1 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         std::thread::sleep(Duration::from_secs(1));
 
         let timestamp2 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close();
 
@@ -459,7 +471,7 @@ mod tests {
     fn rotate_by_time_and_zip() {
         let root_dir = "./target/tmp6";
         let _ = std::fs::remove_dir_all(root_dir);
-        let rotating_file = super::RotatingFile::new(
+        let mut rotating_file = super::RotatingFile::new(
             root_dir,
             None,
             Some(1),
@@ -470,12 +482,12 @@ mod tests {
         );
 
         let timestamp1 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         std::thread::sleep(Duration::from_secs(1));
 
         let timestamp2 = current_timestamp_str();
-        rotating_file.writeln(TEXT).unwrap();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close();
 
@@ -488,39 +500,41 @@ mod tests {
     #[test]
     fn referred_in_two_threads() {
         static ROOT_DIR: Lazy<&'static str> = Lazy::new(|| "./target/tmp7");
-        static ROTATING_FILE: Lazy<super::RotatingFile> = Lazy::new(|| {
-            super::RotatingFile::new(
-                *ROOT_DIR,
-                Some(1),
-                None,
-                Some(super::Compression::GZip),
-                None,
-                None,
-                None,
-            )
+        static ROTATING_FILE: Lazy<Mutex<super::RotatingFile>> = Lazy::new(|| {
+            Mutex::new({
+                super::RotatingFile::new(
+                    *ROOT_DIR,
+                    Some(1),
+                    None,
+                    Some(super::Compression::GZip),
+                    None,
+                    None,
+                    None,
+                )
+            })
         });
         let _ = std::fs::remove_dir_all(*ROOT_DIR);
 
         let timestamp = current_timestamp_str();
         let handle1 = std::thread::spawn(move || {
             for _ in 0..23 {
-                ROTATING_FILE.writeln(TEXT).unwrap();
+                writeln!(ROTATING_FILE.lock().unwrap(), "{}", TEXT).unwrap();
             }
         });
 
         let handle2 = std::thread::spawn(move || {
             for _ in 0..23 {
-                ROTATING_FILE.writeln(TEXT).unwrap();
+                writeln!(ROTATING_FILE.lock().unwrap(), "{}", TEXT).unwrap();
             }
         });
 
         // trigger the third file creation
-        ROTATING_FILE.writeln(TEXT).unwrap();
+        writeln!(ROTATING_FILE.lock().unwrap(), "{}", TEXT).unwrap();
 
         let _ = handle1.join();
         let _ = handle2.join();
 
-        ROTATING_FILE.close();
+        ROTATING_FILE.lock().unwrap().close();
 
         assert!(Path::new(*ROOT_DIR)
             .join(timestamp.clone() + ".log.gz")
