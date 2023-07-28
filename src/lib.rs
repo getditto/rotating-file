@@ -309,6 +309,12 @@ impl RotatingFile {
     }
 }
 
+impl Drop for RotatingFile {
+    fn drop(&mut self) {
+        self.close();
+    }
+}
+
 impl Write for RotatingFile {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
         let mut guard = self.context.lock().unwrap();
