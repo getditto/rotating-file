@@ -205,7 +205,10 @@ impl RotatingFile {
             now
         };
 
-        let dt = DateTime::<Utc>::from_utc(NaiveDateTime::from_timestamp(timestamp as i64, 0), Utc);
+        let dt = DateTime::<Utc>::from_utc(
+            NaiveDateTime::from_timestamp_opt(timestamp as i64, 0).unwrap(),
+            Utc,
+        );
         let dt_str = dt.format(date_format).to_string();
 
         let mut file_name = format!("{}{}{}", prefix, dt_str, suffix);
