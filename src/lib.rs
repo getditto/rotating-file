@@ -68,6 +68,60 @@ pub struct RotatingFile {
     handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
 }
 
+pub struct RotatingFileBuilder<'a> {
+    root_dir: &'a str,
+    size: Option<usize>,
+    interval: Option<u64>,
+    compression: Option<Compression>,
+    date_format: Option<String>,
+    prefix: Option<String>,
+    suffix: Option<String>,
+}
+
+impl RotatingFileBuilder<'_> {
+    pub fn size(mut self, size: usize) -> Self {
+        self.size = Some(size);
+        self
+    }
+
+    pub fn interval(mut self, interval: u64) -> Self {
+        self.interval = Some(interval);
+        self
+    }
+
+    pub fn compression(mut self, compression: Compression) -> Self {
+        self.compression = Some(compression);
+        self
+    }
+
+    pub fn date_format(mut self, date_format: String) -> Self {
+        self.date_format = Some(date_format);
+        self
+    }
+
+    pub fn prefix(mut self, prefix: String) -> Self {
+        self.prefix = Some(prefix);
+        self
+    }
+
+    pub fn suffix(mut self, suffix: String) -> Self {
+        self.suffix = Some(suffix);
+        self
+    }
+
+    pub fn finish(self) -> RotatingFile {
+        RotatingFile::new(
+            self.root_dir,
+            self.size,
+            self.interval,
+            self.compression,
+            self.date_format,
+            self.prefix,
+            self.suffix,
+        )
+    }
+}
+
 impl RotatingFile {
     /// Creates a new RotatingFile.
     ///
@@ -119,6 +173,18 @@ impl RotatingFile {
             suffix,
             context: Mutex::new(context),
             handles: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    pub fn build(root_dir: &str) -> RotatingFileBuilder<'_> {
+        RotatingFileBuilder {
+            root_dir,
+            size: None,
+            interval: None,
+            compression: None,
+            date_format: None,
+            prefix: None,
+            suffix: None,
         }
     }
 
