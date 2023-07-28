@@ -67,9 +67,6 @@ pub struct RotatingFile {
     handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
 }
 
-unsafe impl Send for RotatingFile {}
-unsafe impl Sync for RotatingFile {}
-
 impl RotatingFile {
     /// Creates a new RotatingFile.
     ///
