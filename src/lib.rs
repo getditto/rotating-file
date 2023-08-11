@@ -11,7 +11,7 @@
 //! let _ = std::fs::remove_dir_all(root_dir);
 //!
 //! // rotated by 1 kilobyte, compressed with gzip
-//! let mut rotating_file = RotatingFile::new(root_dir, Some(1), None, None, None, None, None);
+//! let mut rotating_file = RotatingFile::build(root_dir.into()).size(1).finish();
 //! for _ in 0..24 {
 //!     writeln!(rotating_file, "{}", s).unwrap();
 //! }
@@ -70,6 +70,9 @@ pub struct RotatingFile {
     handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
 }
 
+/// Builder for a [`RotatingFile`].
+///
+/// Created by the [`build()`](RotatingFile::build()) method.
 pub struct RotatingFileBuilder {
     root_dir: PathBuf,
     size: Option<usize>,
@@ -81,97 +84,78 @@ pub struct RotatingFileBuilder {
 }
 
 impl RotatingFileBuilder {
+    /// Set the maximum size (in kilobytes) of any one file before rotating to the next file.
     pub fn size(mut self, size: usize) -> Self {
         self.size = Some(size);
         self
     }
 
+    /// Set the interval (in seconds) between file rotations.
     pub fn interval(mut self, interval: u64) -> Self {
         self.interval = Some(interval);
         self
     }
 
+    /// Set the type of [compression](Compression) to use for files when rotating away from them.
+    ///
+    /// Available values are:
+    ///
+    /// - `Compression::GZip`
+    /// - `Compression::Zip` (requires the `zip` feature)
     pub fn compression(mut self, compression: Compression) -> Self {
         self.compression = Some(compression);
         self
     }
 
+    /// Set the format to use for the date and time in filenames.
+    ///
+    /// Uses the syntax from [`chrono`].
     pub fn date_format(mut self, date_format: String) -> Self {
         self.date_format = Some(date_format);
         self
     }
 
+    /// Set the prefix string for the name of every file.
     pub fn prefix(mut self, prefix: String) -> Self {
         self.prefix = Some(prefix);
         self
     }
 
+    /// Set the suffix string for the name of every file.
     pub fn suffix(mut self, suffix: String) -> Self {
         self.suffix = Some(suffix);
         self
     }
 
+    /// Build the [`RotatingFile`].
     pub fn finish(self) -> RotatingFile {
-        RotatingFile::new(
-            self.root_dir,
-            self.size,
-            self.interval,
-            self.compression,
-            self.date_format,
-            self.prefix,
-            self.suffix,
-        )
-    }
-}
+        let root_dir = self.root_dir.to_path_buf();
 
-impl RotatingFile {
-    /// Creates a new RotatingFile.
-    ///
-    /// ## Arguments
-    ///
-    /// - `root_dir` The directory to store files.
-    /// - `size` Max size(in kilobytes) of the file after which it will rotate,
-    ///   `None` and `0` mean unlimited.
-    /// - `interval` How often(in seconds) to rotate, 0 means unlimited.
-    /// - `compression` Available values are `GZip` and `Zip` (requires feature `zip`), default to
-    ///   `None`
-    /// - `date_format` uses the syntax from chrono
-    ///   <https://docs.rs/chrono/latest/chrono/format/strftime/>, default to `%Y-%m-%d-%H-%M-%S`
-    /// - `prefix` File name prefix, default to empty
-    /// - `suffix` File name suffix, default to `.log`
-    pub fn new<P>(
-        root_dir: P,
-        size: Option<usize>,
-        interval: Option<u64>,
-        compression: Option<Compression>,
-        date_format: Option<String>,
-        prefix: Option<String>,
-        suffix: Option<String>,
-    ) -> Self
-    where
-        P: AsRef<Path>,
-    {
-        if let Err(e) = std::fs::create_dir_all(&root_dir) {
-            error!("{}", e);
+        if let Err(err) = std::fs::create_dir_all(&root_dir) {
+            error!("{err}");
         }
 
-        let interval = interval.unwrap_or(0);
+        let size = self.size.unwrap_or(0);
+        let interval = self.interval.unwrap_or(0);
+        let compression = self.compression;
 
-        let date_format = date_format.unwrap_or_else(|| "%Y-%m-%d-%H-%M-%S".to_string());
-        let prefix = prefix.unwrap_or_else(|| "".to_string());
-        let suffix = suffix.unwrap_or_else(|| ".log".to_string());
+        let date_format = self
+            .date_format
+            .unwrap_or_else(|| "%Y-%m-%d-%H-%M-%S".to_string());
+        let prefix = self.prefix.unwrap_or_else(|| "".to_string());
+        let suffix = self.suffix.unwrap_or_else(|| ".log".to_string());
 
-        let context = Self::create_context(
+        let context = RotatingFile::create_context(
             interval,
-            root_dir.as_ref(),
+            &root_dir,
             date_format.as_str(),
             prefix.as_str(),
             suffix.as_str(),
         );
 
         RotatingFile {
-            root_dir: root_dir.as_ref().to_path_buf(),
-            size: size.unwrap_or(0),
+            root_dir,
+            size,
             interval,
             compression,
             date_format,
@@ -181,13 +165,12 @@ impl RotatingFile {
             handles: Arc::new(Mutex::new(Vec::new())),
         }
     }
+}
 
-    pub fn build<P>(root_dir: P) -> RotatingFileBuilder
-    where
-        P: AsRef<Path>,
-    {
+impl RotatingFile {
+    pub fn build(root_dir: PathBuf) -> RotatingFileBuilder {
         RotatingFileBuilder {
-            root_dir: root_dir.as_ref().to_path_buf(),
+            root_dir,
             size: None,
             interval: None,
             compression: None,
@@ -416,6 +399,8 @@ mod tests {
     use std::time::SystemTime;
     use std::{io::Write, sync::Mutex};
 
+    use crate::{Compression, RotatingFile};
+
     const TEXT: &'static str = "The quick brown fox jumps over the lazy dog";
 
     #[test]
@@ -423,8 +408,7 @@ mod tests {
         let root_dir = PathBuf::from("./target/tmp1");
         let _ = std::fs::remove_dir_all(&root_dir);
         let timestamp = current_timestamp_str();
-        let mut rotating_file =
-            super::RotatingFile::new(&root_dir, Some(1), None, None, None, None, None);
+        let mut rotating_file = RotatingFile::build(root_dir.clone()).size(1).finish();
 
         for _ in 0..23 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -438,8 +422,7 @@ mod tests {
         std::fs::remove_dir_all(&root_dir).unwrap();
 
         let timestamp = current_timestamp_str();
-        let mut rotating_file =
-            super::RotatingFile::new(&root_dir, Some(1), None, None, None, None, None);
+        let mut rotating_file = RotatingFile::build(root_dir.clone()).size(1).finish();
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -461,8 +444,7 @@ mod tests {
     fn rotate_by_time() {
         let root_dir = PathBuf::from("./target/tmp2");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let mut rotating_file =
-            super::RotatingFile::new(&root_dir, None, Some(1), None, None, None, None);
+        let mut rotating_file = RotatingFile::build(root_dir.clone()).interval(1).finish();
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -485,15 +467,10 @@ mod tests {
         let root_dir = PathBuf::from("./target/tmp3");
         let _ = std::fs::remove_dir_all(&root_dir);
         let timestamp = current_timestamp_str();
-        let mut rotating_file = super::RotatingFile::new(
-            &root_dir,
-            Some(1),
-            None,
-            Some(super::Compression::GZip),
-            None,
-            None,
-            None,
-        );
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .compression(Compression::GZip)
+            .finish();
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -513,15 +490,10 @@ mod tests {
         let root_dir = PathBuf::from("./target/tmp4");
         let _ = std::fs::remove_dir_all(&root_dir);
         let timestamp = current_timestamp_str();
-        let mut rotating_file = super::RotatingFile::new(
-            &root_dir,
-            Some(1),
-            None,
-            Some(super::Compression::Zip),
-            None,
-            None,
-            None,
-        );
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .compression(Compression::Zip)
+            .finish();
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -539,15 +511,10 @@ mod tests {
     fn rotate_by_time_and_gzip() {
         let root_dir = PathBuf::from("./target/tmp5");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let mut rotating_file = super::RotatingFile::new(
-            &root_dir,
-            None,
-            Some(1),
-            Some(super::Compression::GZip),
-            None,
-            None,
-            None,
-        );
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .interval(1)
+            .compression(Compression::GZip)
+            .finish();
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -570,15 +537,10 @@ mod tests {
     fn rotate_by_time_and_zip() {
         let root_dir = PathBuf::from("./target/tmp6");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let mut rotating_file = super::RotatingFile::new(
-            &root_dir,
-            None,
-            Some(1),
-            Some(super::Compression::Zip),
-            None,
-            None,
-            None,
-        );
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .interval(1)
+            .compression(Compression::Zip)
+            .finish();
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -599,11 +561,8 @@ mod tests {
     #[test]
     fn referred_in_two_threads() {
         static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp7".into());
-        static ROTATING_FILE: Lazy<Mutex<super::RotatingFile>> = Lazy::new(|| {
-            Mutex::new({
-                super::RotatingFile::new(&*ROOT_DIR, Some(1), None, None, None, None, None)
-            })
-        });
+        static ROTATING_FILE: Lazy<Mutex<RotatingFile>> =
+            Lazy::new(|| Mutex::new(RotatingFile::build(ROOT_DIR.clone()).size(1).finish()));
         let _ = std::fs::remove_dir_all(&*ROOT_DIR);
 
         let timestamp = current_timestamp_str();
