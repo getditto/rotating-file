@@ -222,7 +222,6 @@ impl RotatingFile {
             }
         }
         drop(handles);
-
     }
 
     fn create_context(
