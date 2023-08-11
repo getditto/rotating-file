@@ -20,6 +20,7 @@
 //! assert_eq!(2, std::fs::read_dir(root_dir).unwrap().count());
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
+
 use std::io::Write;
 use std::path::Path;
 use std::thread::JoinHandle;
@@ -34,6 +35,7 @@ use log::*;
 #[derive(Copy, Clone)]
 pub enum Compression {
     GZip,
+    #[cfg(feature = "zip")]
     Zip,
 }
 
@@ -129,11 +131,12 @@ impl RotatingFile {
     ///
     /// - `root_dir` The directory to store files.
     /// - `size` Max size(in kilobytes) of the file after which it will rotate,
-    /// `None` and `0` mean unlimited.
+    ///   `None` and `0` mean unlimited.
     /// - `interval` How often(in seconds) to rotate, 0 means unlimited.
-    /// - `compression` Available values are `GZip` and `Zip`, default to `None`
+    /// - `compression` Available values are `GZip` and `Zip` (requires feature `zip`), default to
+    ///   `None`
     /// - `date_format` uses the syntax from chrono
-    /// <https://docs.rs/chrono/latest/chrono/format/strftime/>, default to `%Y-%m-%d-%H-%M-%S`
+    ///   <https://docs.rs/chrono/latest/chrono/format/strftime/>, default to `%Y-%m-%d-%H-%M-%S`
     /// - `prefix` File name prefix, default to empty
     /// - `suffix` File name suffix, default to `.log`
     pub fn new(
@@ -266,6 +269,7 @@ impl RotatingFile {
         let mut out_file_path = file.clone();
         match compress {
             Compression::GZip => out_file_path.push(".gz"),
+            #[cfg(feature = "zip")]
             Compression::Zip => out_file_path.push(".zip"),
         }
 
@@ -282,6 +286,7 @@ impl RotatingFile {
                 encoder.write_all(&input_buf)?;
                 encoder.flush()?;
             }
+            #[cfg(feature = "zip")]
             Compression::Zip => {
                 let file_name = Path::new(file.as_os_str())
                     .file_name()
@@ -480,6 +485,7 @@ mod tests {
         std::fs::remove_dir_all(root_dir).unwrap();
     }
 
+    #[cfg(feature = "zip")]
     #[test]
     fn rotate_by_size_and_zip() {
         let root_dir = "./target/tmp4";
@@ -539,6 +545,7 @@ mod tests {
         std::fs::remove_dir_all(root_dir).unwrap();
     }
 
+    #[cfg(feature = "zip")]
     #[test]
     fn rotate_by_time_and_zip() {
         let root_dir = "./target/tmp6";
