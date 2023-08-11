@@ -324,8 +324,8 @@ impl Drop for RotatingFile {
     }
 }
 
-impl Write for RotatingFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+impl RotatingFile {
+    pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         let mut guard = self.context.lock().unwrap();
 
         let now = SystemTime::now()
@@ -373,9 +373,29 @@ impl Write for RotatingFile {
         }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    pub fn flush(&self) -> std::io::Result<()> {
         let mut guard = self.context.lock().unwrap();
         guard.file.flush()
+    }
+}
+
+impl Write for RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        RotatingFile::write(self, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        RotatingFile::flush(self)
+    }
+}
+
+impl Write for &RotatingFile {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        RotatingFile::write(self, buf)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        RotatingFile::flush(self)
     }
 }
 
