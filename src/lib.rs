@@ -198,6 +198,22 @@ impl RotatingFile {
     }
 
     pub fn close(&self) {
+        let mut guard = self.context.lock().unwrap();
+        if let Err(e) = guard.file.flush() {
+            error!("{}", e);
+        }
+        if let Err(e) = guard.file.get_ref().sync_all() {
+            error!("{}", e);
+        }
+
+        // compress in a background thread
+        if let Some(c) = self.compression {
+            let file_path = guard.file_path.clone();
+            let handles_clone = self.handles.clone();
+            let handle = std::thread::spawn(move || Self::compress(file_path, c, handles_clone));
+            self.handles.lock().unwrap().push(handle);
+        }
+
         // wait for compression threads
         let mut handles = self.handles.lock().unwrap();
         for handle in handles.drain(..) {
@@ -207,13 +223,6 @@ impl RotatingFile {
         }
         drop(handles);
 
-        let mut guard = self.context.lock().unwrap();
-        if let Err(e) = guard.file.flush() {
-            error!("{}", e);
-        }
-        if let Err(e) = guard.file.get_ref().sync_all() {
-            error!("{}", e);
-        }
     }
 
     fn create_context(
@@ -494,7 +503,7 @@ mod tests {
         rotating_file.close();
 
         assert!(root_dir.join(timestamp.clone() + ".log.gz").exists());
-        assert!(root_dir.join(timestamp + "-1.log").exists());
+        assert!(root_dir.join(timestamp + "-1.log.gz").exists());
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -522,7 +531,7 @@ mod tests {
         rotating_file.close();
 
         assert!(root_dir.join(timestamp.clone() + ".log.zip").exists());
-        assert!(root_dir.join(timestamp + "-1.log").exists());
+        assert!(root_dir.join(timestamp + "-1.log.zip").exists());
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -552,7 +561,7 @@ mod tests {
         rotating_file.close();
 
         assert!(root_dir.join(timestamp1 + ".log.gz").exists());
-        assert!(root_dir.join(timestamp2 + ".log").exists());
+        assert!(root_dir.join(timestamp2 + ".log.gz").exists());
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -583,7 +592,7 @@ mod tests {
         rotating_file.close();
 
         assert!(root_dir.join(timestamp1 + ".log.zip").exists());
-        assert!(root_dir.join(timestamp2 + ".log").exists());
+        assert!(root_dir.join(timestamp2 + ".log.zip").exists());
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -593,15 +602,7 @@ mod tests {
         static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp7".into());
         static ROTATING_FILE: Lazy<Mutex<super::RotatingFile>> = Lazy::new(|| {
             Mutex::new({
-                super::RotatingFile::new(
-                    &*ROOT_DIR,
-                    Some(1),
-                    None,
-                    Some(super::Compression::GZip),
-                    None,
-                    None,
-                    None,
-                )
+                super::RotatingFile::new(&*ROOT_DIR, Some(1), None, None, None, None, None)
             })
         });
         let _ = std::fs::remove_dir_all(&*ROOT_DIR);
@@ -627,8 +628,8 @@ mod tests {
 
         ROTATING_FILE.lock().unwrap().close();
 
-        assert!(ROOT_DIR.join(timestamp.clone() + ".log.gz").exists());
-        assert!(ROOT_DIR.join(timestamp.clone() + "-1.log.gz").exists());
+        assert!(ROOT_DIR.join(timestamp.clone() + ".log").exists());
+        assert!(ROOT_DIR.join(timestamp.clone() + "-1.log").exists());
 
         let third_file = ROOT_DIR.join(timestamp.clone() + "-2.log");
         assert!(third_file.exists());
