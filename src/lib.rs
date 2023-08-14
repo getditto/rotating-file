@@ -21,16 +21,20 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-use std::io::Write;
-use std::path::{Path, PathBuf};
-use std::thread::JoinHandle;
 use std::time::{SystemTime, UNIX_EPOCH};
-use std::{ffi::OsString, fs, io::Error, sync::Mutex};
+use std::{collections::VecDeque, io::Write};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
+use std::{fs, io::Error, sync::Mutex};
+use std::{io, thread::JoinHandle};
 use std::{io::BufWriter, sync::Arc};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use flate2::write::GzEncoder;
 use log::*;
+use thiserror::Error;
 
 #[derive(Copy, Clone)]
 pub enum Compression {
@@ -39,9 +43,27 @@ pub enum Compression {
     Zip,
 }
 
+impl Compression {
+    fn extension(self) -> &'static str {
+        match self {
+            Compression::GZip => ".gz",
+            #[cfg(feature = "zip")]
+            Compression::Zip => ".zip",
+        }
+    }
+}
+
+#[derive(Copy, Clone)]
+pub enum CleanupStrategy {
+    MatchingFormat,
+    All,
+}
+
 struct CurrentContext {
     file: BufWriter<fs::File>,
     file_path: OsString,
+    // list of paths to rotated or discovered log files on disk
+    file_history: VecDeque<OsString>,
     timestamp: u64,
     total_written: usize,
 }
@@ -54,6 +76,9 @@ pub struct RotatingFile {
     size: usize,
     /// How often(in seconds) to rotate, 0 means unlimited
     interval: u64,
+    /// Max number of files on disk after which the oldest will be deleted on rotation, 0 means
+    /// unlimited
+    files: usize,
     /// Compression method, default to None
     compression: Option<Compression>,
 
@@ -77,6 +102,7 @@ pub struct RotatingFileBuilder {
     root_dir: PathBuf,
     size: Option<usize>,
     interval: Option<u64>,
+    files: Option<(usize, CleanupStrategy)>,
     compression: Option<Compression>,
     date_format: Option<String>,
     prefix: Option<String>,
@@ -107,6 +133,20 @@ impl RotatingFileBuilder {
         self
     }
 
+    /// Set the maximum number of files on disk before the oldest will be removed on rotation.
+    ///
+    /// You must also provide a [`CleanupStrategy`], which determines whether:
+    ///
+    /// - Only files with a matching [prefix](Self::prefix()) and [suffix](Self::suffix()) in their
+    ///   name will count towards the limit and be at risk of removal
+    ///   (`CleanupStrategy::MatchingName`), or
+    /// - All files in the root directory will count towards limit and be at risk of removal
+    ///   (`CleanupStrategy::All`).
+    pub fn files(mut self, files: usize, strategy: CleanupStrategy) -> Self {
+        self.files = Some((files, strategy));
+        self
+    }
+
     /// Set the format to use for the date and time in filenames.
     ///
     /// Uses the syntax from [`chrono`].
@@ -129,9 +169,9 @@ impl RotatingFileBuilder {
 
     /// Build the [`RotatingFile`].
     pub fn finish(self) -> RotatingFile {
-        let root_dir = self.root_dir.to_path_buf();
+        let root_dir = self.root_dir;
 
-        if let Err(err) = std::fs::create_dir_all(&root_dir) {
+        if let Err(err) = fs::create_dir_all(&root_dir) {
             error!("{err}");
         }
 
@@ -145,9 +185,22 @@ impl RotatingFileBuilder {
         let prefix = self.prefix.unwrap_or_else(|| "".to_string());
         let suffix = self.suffix.unwrap_or_else(|| ".log".to_string());
 
+        let (files, file_history) = if let Some((limit, strategy)) = self.files {
+            match RotatingFile::collect_existing_files(&root_dir, &prefix, &suffix, strategy) {
+                Ok(existing_files) => (limit, existing_files),
+                Err(err) => {
+                    error!("unable to collect existing files from {root_dir:?}: {err}");
+                    (limit, VecDeque::new())
+                }
+            }
+        } else {
+            (0, VecDeque::new())
+        };
+
         let context = RotatingFile::create_context(
             interval,
             &root_dir,
+            file_history,
             date_format.as_str(),
             prefix.as_str(),
             suffix.as_str(),
@@ -157,6 +210,7 @@ impl RotatingFileBuilder {
             root_dir,
             size,
             interval,
+            files,
             compression,
             date_format,
             prefix,
@@ -173,6 +227,7 @@ impl RotatingFile {
             root_dir,
             size: None,
             interval: None,
+            files: None,
             compression: None,
             date_format: None,
             prefix: None,
@@ -207,9 +262,48 @@ impl RotatingFile {
         drop(handles);
     }
 
+    fn collect_existing_files(
+        root_dir: &Path,
+        prefix: &str,
+        suffix: &str,
+        strategy: CleanupStrategy,
+    ) -> Result<VecDeque<OsString>, CollectFilesError> {
+        let mut all_have_created_time = true;
+
+        let mut results = fs::read_dir(root_dir)
+            .map_err(|err| CollectFilesError::ReadDir(root_dir.to_path_buf(), err))?
+            .flatten()
+            .filter(|entry| match strategy {
+                CleanupStrategy::MatchingFormat => {
+                    let name = entry.file_name();
+                    let name_str = name.to_string_lossy();
+                    name_str.starts_with(prefix) && name_str.ends_with(suffix)
+                }
+                CleanupStrategy::All => true,
+            })
+            .map(|entry| {
+                let created_time = entry.metadata().and_then(|meta| meta.created()).ok();
+                all_have_created_time &= created_time.is_some();
+                (entry, created_time)
+            })
+            .collect::<Vec<_>>();
+
+        if all_have_created_time {
+            results.sort_by_key(|(_, created)| created.unwrap());
+        } else {
+            results.sort_by_key(|(entry, _)| entry.file_name());
+        }
+
+        Ok(results
+            .into_iter()
+            .map(|(entry, _)| entry.path().as_os_str().to_os_string())
+            .collect::<VecDeque<_>>())
+    }
+
     fn create_context(
         interval: u64,
         root_dir: &Path,
+        file_history: VecDeque<OsString>,
         date_format: &str,
         prefix: &str,
         suffix: &str,
@@ -251,6 +345,7 @@ impl RotatingFile {
         CurrentContext {
             file: BufWriter::new(file),
             file_path,
+            file_history,
             timestamp,
             total_written: 0,
         }
@@ -262,11 +357,7 @@ impl RotatingFile {
         handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
     ) -> Result<(), Error> {
         let mut out_file_path = file.clone();
-        match compress {
-            Compression::GZip => out_file_path.push(".gz"),
-            #[cfg(feature = "zip")]
-            Compression::Zip => out_file_path.push(".zip"),
-        }
+        out_file_path.push(compress.extension());
 
         let out_file = fs::OpenOptions::new()
             .write(true)
@@ -329,12 +420,38 @@ impl RotatingFile {
         {
             guard.file.flush()?;
             guard.file.get_ref().sync_all()?;
+
             let old_file = guard.file_path.clone();
+
+            let history_file = if let Some(c) = self.compression {
+                let mut history_file = old_file.clone();
+                history_file.push(c.extension());
+                history_file
+            } else {
+                old_file.clone()
+            };
+
+            let mut file_history = guard.file_history.clone();
+            file_history.push_back(history_file);
+
+            while self.files > 0 && file_history.len() >= self.files {
+                let Some(to_remove) = file_history.pop_front() else {
+                    break;
+                };
+                if let Err(err) = std::fs::remove_file(&to_remove) {
+                    error!(
+                        "failed to remove old file {}: {}",
+                        to_remove.to_string_lossy(),
+                        err
+                    );
+                }
+            }
 
             // reset context
             *guard = Self::create_context(
                 self.interval,
                 &self.root_dir,
+                file_history,
                 self.date_format.as_str(),
                 self.prefix.as_str(),
                 self.suffix.as_str(),
@@ -390,16 +507,22 @@ impl Write for &RotatingFile {
     }
 }
 
+#[derive(Error, Debug)]
+pub enum CollectFilesError {
+    #[error("failed to read contents of dir {0}: {1}")]
+    ReadDir(PathBuf, #[source] io::Error),
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
     use once_cell::sync::Lazy;
-    use std::path::PathBuf;
     use std::time::Duration;
     use std::time::SystemTime;
     use std::{io::Write, sync::Mutex};
+    use std::{ops::Not, path::PathBuf};
 
-    use crate::{Compression, RotatingFile};
+    use crate::{CleanupStrategy, Compression, RotatingFile};
 
     const TEXT: &'static str = "The quick brown fox jumps over the lazy dog";
 
@@ -559,8 +682,44 @@ mod tests {
     }
 
     #[test]
+    fn rotate_by_max_files() {
+        let root_dir = PathBuf::from("./target/tmp7");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .interval(1)
+            .files(2, CleanupStrategy::All)
+            .finish();
+
+        let timestamp1 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir.join(timestamp1.clone() + ".log").exists());
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let timestamp2 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir.join(timestamp1.clone() + ".log").exists());
+        assert!(root_dir.join(timestamp2.clone() + ".log").exists());
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let timestamp3 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir.join(timestamp1 + ".log").exists().not());
+        assert!(root_dir.join(timestamp2 + ".log").exists());
+        assert!(root_dir.join(timestamp3 + ".log").exists());
+
+        rotating_file.close();
+
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[test]
     fn referred_in_two_threads() {
-        static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp7".into());
+        static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp8".into());
         static ROTATING_FILE: Lazy<Mutex<RotatingFile>> =
             Lazy::new(|| Mutex::new(RotatingFile::build(ROOT_DIR.clone()).size(1).finish()));
         let _ = std::fs::remove_dir_all(&*ROOT_DIR);
@@ -597,6 +756,120 @@ mod tests {
         );
 
         std::fs::remove_dir_all(&*ROOT_DIR).unwrap();
+    }
+
+    #[test]
+    fn clean_up_existing_matching_name() {
+        let root_dir = PathBuf::from("./target/tmp9");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .prefix("test-logs-".into())
+            .suffix(".test.log".into())
+            .finish();
+
+        let timestamp1 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists());
+
+        rotating_file.close();
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .prefix("test-logs-".into())
+            .suffix(".test.log".into())
+            .interval(1)
+            .files(2, CleanupStrategy::MatchingFormat)
+            .finish();
+
+        let guard = rotating_file.context.lock().unwrap();
+        drop(guard);
+
+        let timestamp2 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists());
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp2 + ".test.log")
+            .exists());
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let timestamp3 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists()
+            .not());
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp2 + ".test.log")
+            .exists());
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp3 + ".test.log")
+            .exists());
+
+        rotating_file.close();
+
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[test]
+    fn clean_up_existing_all() {
+        let root_dir = PathBuf::from("./target/tmp10");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .prefix("test-logs-".into())
+            .suffix(".test.log".into())
+            .finish();
+
+        let timestamp1 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists());
+
+        rotating_file.close();
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .interval(1)
+            .files(2, CleanupStrategy::All)
+            .finish();
+
+        let guard = rotating_file.context.lock().unwrap();
+        drop(guard);
+
+        let timestamp2 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists());
+        assert!(root_dir.join(timestamp2.clone() + ".log").exists());
+
+        std::thread::sleep(Duration::from_secs(1));
+
+        let timestamp3 = current_timestamp_str();
+        writeln!(rotating_file, "{}", TEXT).unwrap();
+
+        assert!(root_dir
+            .join("test-logs-".to_string() + &timestamp1 + ".test.log")
+            .exists()
+            .not());
+        assert!(root_dir.join(timestamp2.clone() + ".log").exists());
+        assert!(root_dir.join(timestamp3.clone() + ".log").exists());
+
+        rotating_file.close();
+
+        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     fn current_timestamp_str() -> String {
