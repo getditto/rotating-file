@@ -11,7 +11,7 @@
 //! let _ = std::fs::remove_dir_all(root_dir);
 //!
 //! // rotated by 1 kilobyte, compressed with gzip
-//! let mut rotating_file = RotatingFile::build(root_dir.into()).size(1).finish();
+//! let mut rotating_file = RotatingFile::build(root_dir.into()).size(1).finish().unwrap();
 //! for _ in 0..24 {
 //!     writeln!(rotating_file, "{}", s).unwrap();
 //! }
@@ -21,13 +21,13 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-use std::{collections::VecDeque, io::Write};
+use std::thread::JoinHandle;
+use std::{collections::VecDeque, fmt, io::Write};
 use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
-use std::{fs, io::Error, sync::Mutex};
-use std::{io, thread::JoinHandle};
+use std::{fs, sync::Mutex};
 use std::{io::BufWriter, sync::Arc};
 use std::{
     sync::MutexGuard,
@@ -36,10 +36,15 @@ use std::{
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use flate2::write::GzEncoder;
-use log::*;
-use thiserror::Error;
+use tracing::{debug, error, warn};
 
-#[derive(Copy, Clone)]
+use crate::errors::{
+    BuilderFinishError, CloseError, CollectFilesError, CompressError, RotateError,
+};
+
+mod errors;
+
+#[derive(Debug, Copy, Clone)]
 pub enum Compression {
     GZip,
     #[cfg(feature = "zip")]
@@ -52,6 +57,16 @@ impl Compression {
             Compression::GZip => ".gz",
             #[cfg(feature = "zip")]
             Compression::Zip => ".zip",
+        }
+    }
+}
+
+impl fmt::Display for Compression {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Compression::GZip => write!(f, "gzip"),
+            #[cfg(feature = "zip")]
+            Compression::Zip => write!(f, "zip"),
         }
     }
 }
@@ -95,7 +110,7 @@ pub struct RotatingFile {
     // current context
     context: Mutex<CurrentContext>,
     // compression threads
-    handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
+    handles: Arc<Mutex<Vec<JoinHandle<Result<(), CompressError>>>>>,
 }
 
 /// Builder for a [`RotatingFile`].
@@ -171,12 +186,13 @@ impl RotatingFileBuilder {
     }
 
     /// Build the [`RotatingFile`].
-    pub fn finish(self) -> RotatingFile {
+    pub fn finish(self) -> Result<RotatingFile, BuilderFinishError> {
         let root_dir = self.root_dir;
 
-        if let Err(err) = fs::create_dir_all(&root_dir) {
-            error!("{err}");
-        }
+        fs::create_dir_all(&root_dir).map_err(|error| {
+            error!(?root_dir, %error, "failed to create root directory");
+            BuilderFinishError::CreateRootDir(root_dir.clone(), error)
+        })?;
 
         let size = self.size.unwrap_or(0);
         let interval = self.interval.unwrap_or(0);
@@ -191,8 +207,8 @@ impl RotatingFileBuilder {
         let (files, file_history) = if let Some((limit, strategy)) = self.files {
             match RotatingFile::collect_existing_files(&root_dir, &prefix, &suffix, strategy) {
                 Ok(existing_files) => (limit, existing_files),
-                Err(err) => {
-                    error!("unable to collect existing files from {root_dir:?}: {err}");
+                Err(error) => {
+                    warn!(?root_dir, %error, "unable to collect existing files in root directory; ignoring");
                     (limit, VecDeque::new())
                 }
             }
@@ -209,7 +225,7 @@ impl RotatingFileBuilder {
             suffix.as_str(),
         );
 
-        RotatingFile {
+        Ok(RotatingFile {
             root_dir,
             size,
             interval,
@@ -220,7 +236,7 @@ impl RotatingFileBuilder {
             suffix,
             context: Mutex::new(context),
             handles: Arc::new(Mutex::new(Vec::new())),
-        }
+        })
     }
 }
 
@@ -238,13 +254,25 @@ impl RotatingFile {
         }
     }
 
-    pub fn close(&self) {
+    pub fn close(&self) -> Result<(), CloseError> {
+        self.close_inner(true)
+    }
+
+    fn close_inner(&self, fail_fast: bool) -> Result<(), CloseError> {
         let mut guard = self.context.lock().unwrap();
-        if let Err(e) = guard.file.flush() {
-            error!("{}", e);
+
+        if let Err(error) = guard.file.flush() {
+            error!(path = ?guard.file_path, %error, "failed to flush current file");
+            if fail_fast {
+                return Err(CloseError::Flush(guard.file_path.clone(), error));
+            }
         }
-        if let Err(e) = guard.file.get_ref().sync_all() {
-            error!("{}", e);
+
+        if let Err(error) = guard.file.get_ref().sync_all() {
+            error!(path = ?guard.file_path, %error, "failed to sync metadata for current file");
+            if fail_fast {
+                return Err(CloseError::Sync(guard.file_path.clone(), error));
+            }
         }
 
         // compress in a background thread
@@ -257,12 +285,21 @@ impl RotatingFile {
 
         // wait for compression threads
         let mut handles = self.handles.lock().unwrap();
+        let mut compression_errors = vec![];
         for handle in handles.drain(..) {
-            if let Err(e) = handle.join().unwrap() {
-                error!("{}", e);
+            let thread_id = handle.thread().id();
+            if let Err(error) = handle.join().unwrap() {
+                error!(?thread_id, %error, "compression thread returned an error");
+                compression_errors.push(error);
             }
         }
         drop(handles);
+
+        if compression_errors.is_empty() {
+            Ok(())
+        } else {
+            Err(CloseError::Compression(compression_errors))
+        }
     }
 
     fn collect_existing_files(
@@ -292,8 +329,10 @@ impl RotatingFile {
             .collect::<Vec<_>>();
 
         if all_have_created_time {
+            debug!("sorting collected files by creation time");
             results.sort_by_key(|(_, created)| created.unwrap());
         } else {
+            warn!("failed to read metadata for at least one file; sorting collected files by name");
             results.sort_by_key(|(entry, _)| entry.file_name());
         }
 
@@ -303,9 +342,24 @@ impl RotatingFile {
             .collect::<VecDeque<_>>())
     }
 
-    fn rotate(&self, guard: &mut MutexGuard<CurrentContext>) -> io::Result<()> {
-        guard.file.flush()?;
-        guard.file.get_ref().sync_all()?;
+    fn rotate(
+        &self,
+        guard: &mut MutexGuard<CurrentContext>,
+        fail_fast: bool,
+    ) -> Result<(), RotateError> {
+        if let Err(error) = guard.file.flush() {
+            error!(path = ?guard.file_path, %error, "failed to flush completed file");
+            if fail_fast {
+                return Err(RotateError::Flush(guard.file_path.clone(), error));
+            }
+        }
+
+        if let Err(error) = guard.file.get_ref().sync_all() {
+            error!(path = ?guard.file_path, %error, "failed to sync metadata for completed file");
+            if fail_fast {
+                return Err(RotateError::Sync(guard.file_path.clone(), error));
+            }
+        }
 
         let old_file = guard.file_path.clone();
 
@@ -324,12 +378,11 @@ impl RotatingFile {
             let Some(to_remove) = file_history.pop_front() else {
                 break;
             };
-            if let Err(err) = std::fs::remove_file(&to_remove) {
-                error!(
-                    "failed to remove old file {}: {}",
-                    to_remove.to_string_lossy(),
-                    err
-                );
+            if let Err(error) = std::fs::remove_file(&to_remove) {
+                error!("failed to remove completed file {:?}: {}", to_remove, error);
+                if fail_fast {
+                    return Err(RotateError::Remove(to_remove, error));
+                }
             }
         }
 
@@ -407,23 +460,39 @@ impl RotatingFile {
     fn compress(
         file: OsString,
         compress: Compression,
-        handles: Arc<Mutex<Vec<JoinHandle<Result<(), Error>>>>>,
-    ) -> Result<(), Error> {
+        handles: Arc<Mutex<Vec<JoinHandle<Result<(), CompressError>>>>>,
+    ) -> Result<(), CompressError> {
+        let thread_id = std::thread::current().id();
+        debug!(path = ?file, algorithm = %compress, ?thread_id, "compressing file");
+
         let mut out_file_path = file.clone();
         out_file_path.push(compress.extension());
 
         let out_file = fs::OpenOptions::new()
             .write(true)
             .create(true)
-            .open(out_file_path.as_os_str())?;
+            .open(out_file_path.as_os_str())
+            .map_err(|error| {
+                error!(path = ?out_file_path, %error, "failed to open output file for compression");
+                CompressError::Open(out_file_path.clone(), error)
+            })?;
 
-        let input_buf = fs::read(file.as_os_str())?;
+        let input_buf = fs::read(file.as_os_str()).map_err(|error| {
+            error!(path = ?file, %error, "failed to read input file for compression");
+            CompressError::Read(file.clone(), error)
+        })?;
 
         match compress {
             Compression::GZip => {
                 let mut encoder = GzEncoder::new(out_file, flate2::Compression::new(9));
-                encoder.write_all(&input_buf)?;
-                encoder.flush()?;
+                encoder.write_all(&input_buf).map_err(|error| {
+                    error!(path = ?out_file_path, %error, "failed to write compressed output to file");
+                    CompressError::Write(out_file_path.clone(), error)
+                })?;
+                encoder.flush().map_err(|error| {
+                    error!(path = ?out_file_path, %error, "failed to flush compressed output file");
+                    CompressError::FlushGZip(out_file_path.clone(), error)
+                })?;
             }
             #[cfg(feature = "zip")]
             Compression::Zip => {
@@ -433,13 +502,26 @@ impl RotatingFile {
                     .to_str()
                     .unwrap();
                 let mut zip = zip::ZipWriter::new(out_file);
-                zip.start_file(file_name, zip::write::FileOptions::default())?;
-                zip.write_all(&input_buf)?;
-                zip.finish()?;
+                zip.start_file(file_name, zip::write::FileOptions::default())
+                    .map_err(|error| {
+                        error!(path = ?file, %error, "failed to compress in zip format");
+                        CompressError::Zip(file.clone(), error)
+                    })?;
+                zip.write_all(&input_buf).map_err(|error| {
+                    error!(path = ?out_file_path, %error, "failed to write compressed output to file");
+                    CompressError::Write(out_file_path.clone(), error)
+                })?;
+                zip.finish().map_err(|error| {
+                    error!(path = ?out_file_path, %error, "failed to finish writing zip-compressed output file");
+                    CompressError::FinishZip(out_file_path.clone(), error)
+                })?;
             }
         }
 
-        let ret = fs::remove_file(file.as_os_str());
+        let ret = fs::remove_file(file.as_os_str()).map_err(|error| {
+            error!(path = ?file, %error, "failed to remove compression input file");
+            CompressError::Remove(file.clone(), error)
+        });
 
         // remove from the handles vector
         if let Ok(ref mut guard) = handles.try_lock() {
@@ -455,7 +537,7 @@ impl RotatingFile {
 
 impl Drop for RotatingFile {
     fn drop(&mut self) {
-        self.close();
+        let _ = self.close_inner(false);
     }
 }
 
@@ -471,7 +553,7 @@ impl RotatingFile {
         if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
             || (self.interval > 0 && now >= (guard.timestamp + self.interval))
         {
-            self.rotate(&mut guard)?;
+            self.rotate(&mut guard, true)?;
         }
 
         match guard.file.write(buf) {
@@ -479,13 +561,13 @@ impl RotatingFile {
                 guard.total_written += written;
                 Ok(written)
             }
-            Err(e) => {
+            Err(error) => {
                 error!(
-                    "Failed to write to file {}: {}",
-                    guard.file_path.to_str().unwrap(),
-                    e
+                    path = ?guard.file_path,
+                    %error,
+                    "failed to write to file",
                 );
-                Err(e)
+                Err(error)
             }
         }
     }
@@ -516,12 +598,6 @@ impl Write for &RotatingFile {
     }
 }
 
-#[derive(Error, Debug)]
-pub enum CollectFilesError {
-    #[error("failed to read contents of dir {0}: {1}")]
-    ReadDir(PathBuf, #[source] io::Error),
-}
-
 #[cfg(test)]
 mod tests {
     use chrono::{DateTime, Utc};
@@ -540,13 +616,16 @@ mod tests {
         let root_dir = PathBuf::from("./target/tmp1");
         let _ = std::fs::remove_dir_all(&root_dir);
         let timestamp = current_timestamp_str();
-        let mut rotating_file = RotatingFile::build(root_dir.clone()).size(1).finish();
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .finish()
+            .expect("able to build rotating file");
 
         for _ in 0..23 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp.clone() + ".log").exists());
         assert!(!root_dir.join(timestamp.clone() + "-1.log").exists());
@@ -554,13 +633,16 @@ mod tests {
         std::fs::remove_dir_all(&root_dir).unwrap();
 
         let timestamp = current_timestamp_str();
-        let mut rotating_file = RotatingFile::build(root_dir.clone()).size(1).finish();
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .finish()
+            .expect("able to build rotating file");
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp.clone() + ".log").exists());
         assert!(root_dir.join(timestamp.clone() + "-1.log").exists());
@@ -576,7 +658,10 @@ mod tests {
     fn rotate_by_time() {
         let root_dir = PathBuf::from("./target/tmp2");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let mut rotating_file = RotatingFile::build(root_dir.clone()).interval(1).finish();
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .interval(1)
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -586,7 +671,7 @@ mod tests {
         let timestamp2 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp1 + ".log").exists());
         assert!(root_dir.join(timestamp2 + ".log").exists());
@@ -602,13 +687,14 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .compression(Compression::GZip)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp.clone() + ".log.gz").exists());
         assert!(root_dir.join(timestamp + "-1.log.gz").exists());
@@ -625,13 +711,14 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .compression(Compression::Zip)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         for _ in 0..24 {
             writeln!(rotating_file, "{}", TEXT).unwrap();
         }
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp.clone() + ".log.zip").exists());
         assert!(root_dir.join(timestamp + "-1.log.zip").exists());
@@ -646,7 +733,8 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .compression(Compression::GZip)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -656,7 +744,7 @@ mod tests {
         let timestamp2 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp1 + ".log.gz").exists());
         assert!(root_dir.join(timestamp2 + ".log.gz").exists());
@@ -672,7 +760,8 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .compression(Compression::Zip)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -682,7 +771,7 @@ mod tests {
         let timestamp2 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         assert!(root_dir.join(timestamp1 + ".log.zip").exists());
         assert!(root_dir.join(timestamp2 + ".log.zip").exists());
@@ -697,7 +786,8 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .files(2, CleanupStrategy::All)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -721,7 +811,7 @@ mod tests {
         assert!(root_dir.join(timestamp2 + ".log").exists());
         assert!(root_dir.join(timestamp3 + ".log").exists());
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -729,8 +819,14 @@ mod tests {
     #[test]
     fn referred_in_two_threads() {
         static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp8".into());
-        static ROTATING_FILE: Lazy<Mutex<RotatingFile>> =
-            Lazy::new(|| Mutex::new(RotatingFile::build(ROOT_DIR.clone()).size(1).finish()));
+        static ROTATING_FILE: Lazy<Mutex<RotatingFile>> = Lazy::new(|| {
+            Mutex::new(
+                RotatingFile::build(ROOT_DIR.clone())
+                    .size(1)
+                    .finish()
+                    .expect("able to build rotating file"),
+            )
+        });
         let _ = std::fs::remove_dir_all(&*ROOT_DIR);
 
         let timestamp = current_timestamp_str();
@@ -752,7 +848,11 @@ mod tests {
         let _ = handle1.join();
         let _ = handle2.join();
 
-        ROTATING_FILE.lock().unwrap().close();
+        ROTATING_FILE
+            .lock()
+            .unwrap()
+            .close()
+            .expect("able to close rotating file");
 
         assert!(ROOT_DIR.join(timestamp.clone() + ".log").exists());
         assert!(ROOT_DIR.join(timestamp.clone() + "-1.log").exists());
@@ -774,7 +874,8 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .prefix("test-logs-".into())
             .suffix(".test.log".into())
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -783,7 +884,7 @@ mod tests {
             .join("test-logs-".to_string() + &timestamp1 + ".test.log")
             .exists());
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         std::thread::sleep(Duration::from_secs(1));
 
@@ -792,7 +893,8 @@ mod tests {
             .suffix(".test.log".into())
             .interval(1)
             .files(2, CleanupStrategy::MatchingFormat)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let guard = rotating_file.context.lock().unwrap();
         drop(guard);
@@ -823,7 +925,7 @@ mod tests {
             .join("test-logs-".to_string() + &timestamp3 + ".test.log")
             .exists());
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
@@ -835,7 +937,8 @@ mod tests {
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .prefix("test-logs-".into())
             .suffix(".test.log".into())
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let timestamp1 = current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
@@ -844,14 +947,15 @@ mod tests {
             .join("test-logs-".to_string() + &timestamp1 + ".test.log")
             .exists());
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         std::thread::sleep(Duration::from_secs(1));
 
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .files(2, CleanupStrategy::All)
-            .finish();
+            .finish()
+            .expect("able to build rotating file");
 
         let guard = rotating_file.context.lock().unwrap();
         drop(guard);
@@ -876,7 +980,7 @@ mod tests {
         assert!(root_dir.join(timestamp2.clone() + ".log").exists());
         assert!(root_dir.join(timestamp3.clone() + ".log").exists());
 
-        rotating_file.close();
+        rotating_file.close().expect("able to close rotating file");
 
         std::fs::remove_dir_all(root_dir).unwrap();
     }
