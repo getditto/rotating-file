@@ -42,7 +42,7 @@ use crate::errors::{
     BuilderFinishError, CloseError, CollectFilesError, CompressError, RotateError,
 };
 
-mod errors;
+pub mod errors;
 
 #[derive(Debug, Copy, Clone)]
 pub enum Compression {
