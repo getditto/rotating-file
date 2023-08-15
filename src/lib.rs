@@ -21,7 +21,6 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::{collections::VecDeque, io::Write};
 use std::{
     ffi::OsString,
@@ -30,6 +29,10 @@ use std::{
 use std::{fs, io::Error, sync::Mutex};
 use std::{io, thread::JoinHandle};
 use std::{io::BufWriter, sync::Arc};
+use std::{
+    sync::MutexGuard,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use flate2::write::GzEncoder;
@@ -300,6 +303,56 @@ impl RotatingFile {
             .collect::<VecDeque<_>>())
     }
 
+    fn rotate(&self, guard: &mut MutexGuard<CurrentContext>) -> io::Result<()> {
+        guard.file.flush()?;
+        guard.file.get_ref().sync_all()?;
+
+        let old_file = guard.file_path.clone();
+
+        let history_file = if let Some(c) = self.compression {
+            let mut history_file = old_file.clone();
+            history_file.push(c.extension());
+            history_file
+        } else {
+            old_file.clone()
+        };
+
+        let mut file_history = guard.file_history.clone();
+        file_history.push_back(history_file);
+
+        while self.files > 0 && file_history.len() >= self.files {
+            let Some(to_remove) = file_history.pop_front() else {
+                break;
+            };
+            if let Err(err) = std::fs::remove_file(&to_remove) {
+                error!(
+                    "failed to remove old file {}: {}",
+                    to_remove.to_string_lossy(),
+                    err
+                );
+            }
+        }
+
+        // reset context
+        **guard = Self::create_context(
+            self.interval,
+            &self.root_dir,
+            file_history,
+            self.date_format.as_str(),
+            self.prefix.as_str(),
+            self.suffix.as_str(),
+        );
+
+        // compress in a background thread
+        if let Some(c) = self.compression {
+            let handles_clone = self.handles.clone();
+            let handle = std::thread::spawn(move || Self::compress(old_file, c, handles_clone));
+            self.handles.lock().unwrap().push(handle);
+        }
+
+        Ok(())
+    }
+
     fn create_context(
         interval: u64,
         root_dir: &Path,
@@ -418,51 +471,7 @@ impl RotatingFile {
         if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
             || (self.interval > 0 && now >= (guard.timestamp + self.interval))
         {
-            guard.file.flush()?;
-            guard.file.get_ref().sync_all()?;
-
-            let old_file = guard.file_path.clone();
-
-            let history_file = if let Some(c) = self.compression {
-                let mut history_file = old_file.clone();
-                history_file.push(c.extension());
-                history_file
-            } else {
-                old_file.clone()
-            };
-
-            let mut file_history = guard.file_history.clone();
-            file_history.push_back(history_file);
-
-            while self.files > 0 && file_history.len() >= self.files {
-                let Some(to_remove) = file_history.pop_front() else {
-                    break;
-                };
-                if let Err(err) = std::fs::remove_file(&to_remove) {
-                    error!(
-                        "failed to remove old file {}: {}",
-                        to_remove.to_string_lossy(),
-                        err
-                    );
-                }
-            }
-
-            // reset context
-            *guard = Self::create_context(
-                self.interval,
-                &self.root_dir,
-                file_history,
-                self.date_format.as_str(),
-                self.prefix.as_str(),
-                self.suffix.as_str(),
-            );
-
-            // compress in a background thread
-            if let Some(c) = self.compression {
-                let handles_clone = self.handles.clone();
-                let handle = std::thread::spawn(move || Self::compress(old_file, c, handles_clone));
-                self.handles.lock().unwrap().push(handle);
-            }
+            self.rotate(&mut guard)?;
         }
 
         match guard.file.write(buf) {
