@@ -687,7 +687,7 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
             .read(true)
             .write(true)
             .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
-            .open(path)
+            .open(path)?
             .sync_all()
     }
 }
