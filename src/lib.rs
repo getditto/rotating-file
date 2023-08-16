@@ -35,11 +35,12 @@ use std::{thread::JoinHandle, time::Duration};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
+use either::Either;
 use flate2::write::GzEncoder;
 use tracing::{debug, error, warn};
 
 use crate::errors::{
-    BuilderFinishError, CloseError, CollectFilesError, CompressError, RotateError,
+    BuilderFinishError, CloseError, CollectFilesError, CompressError, CutError, RotateError,
 };
 
 pub mod errors;
@@ -110,7 +111,7 @@ pub struct RotatingFile {
     // current context
     context: Mutex<CurrentContext>,
     // compression threads
-    handles: Arc<Mutex<Vec<JoinHandle<Result<(), CompressError>>>>>,
+    handles: Arc<Mutex<Vec<JoinHandle<Result<OsString, CompressError>>>>>,
 }
 
 /// Builder for a [`RotatingFile`].
@@ -352,11 +353,52 @@ impl RotatingFile {
             .collect::<VecDeque<_>>())
     }
 
+    /// Initiate a rotation of the current file, regardless of whether any of the limits set in
+    /// `Self` have been reached, returning the path to the resulting file.
+    ///
+    /// This function will block to compress the file if compression is enabled, and will return a
+    /// path to the compressed file.
+    pub fn cut(&self) -> Result<OsString, CutError> {
+        let mut guard = self.context.lock().unwrap();
+
+        let file_path = match self.rotate(&mut guard, true)? {
+            Either::Left(uncompressed_path) => uncompressed_path,
+            Either::Right(compression_spawner) => compression_spawner().join().unwrap()?,
+        };
+
+        Ok(file_path)
+    }
+
+    /// Initiates a rotation of the file.
+    ///
+    /// The return type of this function is quite complicated, and here's why:
+    ///
+    /// - Sometimes, there's compression enabled for the file being rotated away from, and sometimes
+    ///   there isn't.
+    /// - If there's compression enabled, we sometimes want to run that compression in the
+    ///   background.
+    /// - But sometimes we need to know the path of the resulting file (such as in
+    ///   [`cut()`](RotatingFile::cut())).
+    /// - Therefore, in order to give the caller access to the path of the resulting file in all
+    ///   cases, we need to give them the opportunity to choose whether to join on the thread to get
+    ///   the resulting path (if compression is being performed) or simply release it to run in the
+    ///   background, storing the join handle for later.
+    /// - So we either:
+    ///   - Return an `Either::Left` containing the path to the file if we aren't performing
+    ///     compression, or
+    ///   - Return an `Either::Right` containing a function that will spawn the compression thread
+    ///     and return its join handle. The caller can then choose what to do with the join handle.
+    ///
+    /// As the caller, the important piece of all this (if you're not interested in the output path)
+    /// is that you must call the fn in the Either::Right if you receive it.
     fn rotate(
         &self,
         guard: &mut MutexGuard<CurrentContext>,
         fail_fast: bool,
-    ) -> Result<(), RotateError> {
+    ) -> Result<
+        Either<OsString, impl FnOnce() -> JoinHandle<Result<OsString, CompressError>>>,
+        RotateError,
+    > {
         if let Err(error) = guard.file.flush() {
             error!(path = ?guard.file_path, %error, "failed to flush completed file");
             if fail_fast {
@@ -407,13 +449,19 @@ impl RotatingFile {
         );
 
         // compress in a background thread
-        if let Some(c) = self.compression {
-            let handles_clone = self.handles.clone();
-            let handle = std::thread::spawn(move || Self::compress(old_file, c, handles_clone));
-            self.handles.lock().unwrap().push(handle);
-        }
+        let path_or_thread_id = self
+            .compression
+            .map(|c| {
+                let handles_clone = self.handles.clone();
+                let old_file = old_file.clone();
+                let c = c.clone();
+                Either::Right(move || {
+                    std::thread::spawn(move || Self::compress(old_file, c, handles_clone))
+                })
+            })
+            .unwrap_or_else(|| Either::Left(old_file));
 
-        Ok(())
+        Ok(path_or_thread_id)
     }
 
     fn create_context(
@@ -467,8 +515,8 @@ impl RotatingFile {
     fn compress(
         file: OsString,
         compress: Compression,
-        handles: Arc<Mutex<Vec<JoinHandle<Result<(), CompressError>>>>>,
-    ) -> Result<(), CompressError> {
+        handles: Arc<Mutex<Vec<JoinHandle<Result<OsString, CompressError>>>>>,
+    ) -> Result<OsString, CompressError> {
         let thread_id = std::thread::current().id();
         debug!(path = ?file, algorithm = %compress, ?thread_id, "compressing file");
 
@@ -552,7 +600,7 @@ impl RotatingFile {
             }
         }
 
-        ret
+        ret.map(|()| out_file_path)
     }
 }
 
@@ -571,7 +619,10 @@ impl RotatingFile {
         if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
             || (self.interval > 0 && now >= (guard.timestamp + self.interval))
         {
-            self.rotate(&mut guard, true)?;
+            if let Either::Right(thread_spawner) = self.rotate(&mut guard, true)? {
+                let handle = thread_spawner();
+                self.handles.lock().unwrap().push(handle);
+            }
         }
 
         match guard.file.write(buf) {
@@ -1032,6 +1083,83 @@ mod tests {
 
         rotating_file.close().expect("able to close rotating file");
 
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[test]
+    fn cut_file_works() {
+        let root_dir = PathBuf::from("./target/tmp11");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let timestamp = current_timestamp_str();
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .finish()
+            .expect("able to build rotating file");
+
+        // Write some stuff into the file, but not enough to cause it to rotate yet.
+        for _ in 0..4 {
+            writeln!(rotating_file, "{}", TEXT).unwrap();
+        }
+
+        // Cut the file. This should cause the rotating file writer to move on to the next file.
+        let resulting_path = rotating_file
+            .cut()
+            .expect("able to cut the rotating file at an arbitrary point");
+
+        assert!(
+            root_dir.join(timestamp.clone() + ".log").exists(),
+            "the original file should exist"
+        );
+
+        assert_eq!(
+            resulting_path,
+            root_dir.join(timestamp.clone() + ".log"),
+            "cut() should have returned a path to the original file"
+        );
+
+        rotating_file.close().expect("able to close rotating file");
+        std::fs::remove_dir_all(root_dir).unwrap();
+    }
+
+    #[test]
+    fn cut_file_compresses() {
+        let root_dir = PathBuf::from("./target/tmp12");
+        let _ = std::fs::remove_dir_all(&root_dir);
+        let timestamp = current_timestamp_str();
+        let mut rotating_file = RotatingFile::build(root_dir.clone())
+            .size(1)
+            .compression(Compression::GZip)
+            .finish()
+            .expect("able to build rotating file");
+
+        // Write some stuff into the file, but not enough to cause it to rotate yet.
+        for _ in 0..4 {
+            writeln!(rotating_file, "{}", TEXT).unwrap();
+        }
+
+        // Cut the file. This should cause it to be compressed and for the rotating file writer to
+        // move on to the next file.
+        let resulting_path = rotating_file
+            .cut()
+            .expect("able to cut the rotating file at an arbitrary point");
+
+        assert!(
+            root_dir.join(timestamp.clone() + ".log.gz").exists(),
+            "the original file should have been compressed after cutting it"
+        );
+
+        assert_eq!(
+            resulting_path,
+            root_dir.join(timestamp.clone() + ".log.gz"),
+            "cut() should have returned a path to the compressed file"
+        );
+
+        assert!(
+            root_dir.join(timestamp.clone() + ".log").exists().not(),
+            "as part of the compression, the original uncompressed file should have been removed"
+        );
+
+        rotating_file.close().expect("able to close rotating file");
         std::fs::remove_dir_all(root_dir).unwrap();
     }
 

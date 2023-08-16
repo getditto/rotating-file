@@ -18,6 +18,15 @@ pub enum CollectFilesError {
 }
 
 #[derive(Error, Debug)]
+pub enum CutError {
+    #[error(transparent)]
+    Rotate(#[from] RotateError),
+
+    #[error(transparent)]
+    Compress(#[from] CompressError),
+}
+
+#[derive(Error, Debug)]
 pub enum RotateError {
     #[error("failed to flush completed file {0:?}: {1}")]
     Flush(OsString, #[source] io::Error),
