@@ -34,6 +34,8 @@ use std::{thread::JoinHandle, time::Duration};
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
 
+#[cfg(test)]
+use chrono::TimeZone;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use either::Either;
 use flate2::write::GzEncoder;
@@ -688,35 +690,87 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     }
 }
 
+#[cfg(test)]
+struct MockWallClock {
+    now: Mutex<DateTime<Utc>>,
+}
+
+#[cfg(test)]
+impl Default for MockWallClock {
+    fn default() -> Self {
+        #[cfg(not(target_arch = "wasm32"))]
+        let duration_since_epoch = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+        #[cfg(target_arch = "wasm32")]
+        let duration_since_epoch = Duration::from_millis(js_sys::Date::now() as u64);
+
+        let now = Utc
+            .timestamp_millis_opt(duration_since_epoch.as_millis() as i64)
+            .single()
+            .expect("current system clock should yield valid timestamp");
+
+        Self {
+            now: Mutex::new(now),
+        }
+    }
+}
+
+#[cfg(test)]
+impl MockWallClock {
+    fn duration_since_epoch(&self) -> Duration {
+        Duration::from_millis(self.now.lock().unwrap().timestamp_millis() as u64)
+    }
+
+    fn current_timestamp_str(&self) -> String {
+        self.now
+            .lock()
+            .unwrap()
+            .format("%Y-%m-%d-%H-%M-%S")
+            .to_string()
+    }
+
+    fn increment_by(&self, duration: Duration) {
+        let mut now = self.now.lock().unwrap();
+        *now += chrono::Duration::from_std(duration)
+            .expect("stdlib Duration should fit within chrono Duration range");
+    }
+}
+
+#[cfg(test)]
+lazy_static::lazy_static! {
+    static ref MOCK_WALL_CLOCK: MockWallClock = MockWallClock::default();
+}
+
 /// Returns duration since unix epoch.
 pub fn wall_clock() -> Duration {
-    #[cfg(not(target_arch = "wasm32"))]
-    let val = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+    #[cfg(test)]
+    return MOCK_WALL_CLOCK.duration_since_epoch();
 
-    #[cfg(target_arch = "wasm32")]
-    let val = Duration::from_millis(js_sys::Date::now() as u64);
+    #[cfg(all(not(target_arch = "wasm32"), not(test)))]
+    return SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
 
-    val
+    #[cfg(all(target_arch = "wasm32", not(test)))]
+    return Duration::from_millis(js_sys::Date::now() as u64);
 }
 
 #[cfg(test)]
 mod tests {
-    use chrono::{DateTime, Utc};
+    use super::*;
+
     use once_cell::sync::Lazy;
+    use serial_test::serial;
     use std::time::Duration;
-    use std::time::SystemTime;
     use std::{io::Write, sync::Mutex};
     use std::{ops::Not, path::PathBuf};
-
-    use crate::{CleanupStrategy, Compression, RotatingFile};
 
     const TEXT: &'static str = "The quick brown fox jumps over the lazy dog";
 
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_size() {
         let root_dir = PathBuf::from("./target/tmp1");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .finish()
@@ -733,7 +787,8 @@ mod tests {
 
         std::fs::remove_dir_all(&root_dir).unwrap();
 
-        let timestamp = current_timestamp_str();
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .finish()
@@ -756,6 +811,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_time() {
         let root_dir = PathBuf::from("./target/tmp2");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -764,12 +820,12 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
-
-        let timestamp2 = current_timestamp_str();
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close().expect("able to close rotating file");
@@ -781,10 +837,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_size_and_gzip() {
         let root_dir = PathBuf::from("./target/tmp3");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .compression(Compression::GZip)
@@ -805,10 +862,11 @@ mod tests {
 
     #[cfg(feature = "zip")]
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_size_and_zip() {
         let root_dir = PathBuf::from("./target/tmp4");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .compression(Compression::Zip)
@@ -828,6 +886,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_time_and_gzip() {
         let root_dir = PathBuf::from("./target/tmp5");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -837,12 +896,12 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
-        let timestamp2 = current_timestamp_str();
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close().expect("able to close rotating file");
@@ -855,6 +914,7 @@ mod tests {
 
     #[cfg(feature = "zip")]
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_time_and_zip() {
         let root_dir = PathBuf::from("./target/tmp6");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -864,12 +924,12 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
-        let timestamp2 = current_timestamp_str();
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         rotating_file.close().expect("able to close rotating file");
@@ -881,6 +941,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn rotate_by_max_files() {
         let root_dir = PathBuf::from("./target/tmp7");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -890,22 +951,20 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir.join(timestamp1.clone() + ".log").exists());
 
-        std::thread::sleep(Duration::from_secs(1));
-
-        let timestamp2 = current_timestamp_str();
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir.join(timestamp1.clone() + ".log").exists());
         assert!(root_dir.join(timestamp2.clone() + ".log").exists());
 
-        std::thread::sleep(Duration::from_secs(1));
-
-        let timestamp3 = current_timestamp_str();
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
+        let timestamp3 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir.join(timestamp1 + ".log").exists().not());
@@ -918,6 +977,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn referred_in_two_threads() {
         static ROOT_DIR: Lazy<PathBuf> = Lazy::new(|| "./target/tmp8".into());
         static ROTATING_FILE: Lazy<Mutex<RotatingFile>> = Lazy::new(|| {
@@ -930,7 +990,7 @@ mod tests {
         });
         let _ = std::fs::remove_dir_all(&*ROOT_DIR);
 
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let handle1 = std::thread::spawn(move || {
             for _ in 0..23 {
                 writeln!(ROTATING_FILE.lock().unwrap(), "{}", TEXT).unwrap();
@@ -969,6 +1029,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn clean_up_existing_matching_name() {
         let root_dir = PathBuf::from("./target/tmp9");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -978,7 +1039,7 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -987,7 +1048,7 @@ mod tests {
 
         rotating_file.close().expect("able to close rotating file");
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .prefix("test-logs-".into())
@@ -1000,7 +1061,7 @@ mod tests {
         let guard = rotating_file.context.lock().unwrap();
         drop(guard);
 
-        let timestamp2 = current_timestamp_str();
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -1010,9 +1071,9 @@ mod tests {
             .join("test-logs-".to_string() + &timestamp2 + ".test.log")
             .exists());
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
-        let timestamp3 = current_timestamp_str();
+        let timestamp3 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -1032,6 +1093,7 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn clean_up_existing_all() {
         let root_dir = PathBuf::from("./target/tmp10");
         let _ = std::fs::remove_dir_all(&root_dir);
@@ -1041,7 +1103,7 @@ mod tests {
             .finish()
             .expect("able to build rotating file");
 
-        let timestamp1 = current_timestamp_str();
+        let timestamp1 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -1050,7 +1112,7 @@ mod tests {
 
         rotating_file.close().expect("able to close rotating file");
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
@@ -1061,7 +1123,7 @@ mod tests {
         let guard = rotating_file.context.lock().unwrap();
         drop(guard);
 
-        let timestamp2 = current_timestamp_str();
+        let timestamp2 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -1069,9 +1131,9 @@ mod tests {
             .exists());
         assert!(root_dir.join(timestamp2.clone() + ".log").exists());
 
-        std::thread::sleep(Duration::from_secs(1));
+        MOCK_WALL_CLOCK.increment_by(Duration::from_secs(1));
 
-        let timestamp3 = current_timestamp_str();
+        let timestamp3 = MOCK_WALL_CLOCK.current_timestamp_str();
         writeln!(rotating_file, "{}", TEXT).unwrap();
 
         assert!(root_dir
@@ -1087,10 +1149,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn cut_file_works() {
         let root_dir = PathBuf::from("./target/tmp11");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .finish()
@@ -1122,10 +1185,11 @@ mod tests {
     }
 
     #[test]
+    #[serial(mock_time)]
     fn cut_file_compresses() {
         let root_dir = PathBuf::from("./target/tmp12");
         let _ = std::fs::remove_dir_all(&root_dir);
-        let timestamp = current_timestamp_str();
+        let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
             .compression(Compression::GZip)
@@ -1161,11 +1225,5 @@ mod tests {
 
         rotating_file.close().expect("able to close rotating file");
         std::fs::remove_dir_all(root_dir).unwrap();
-    }
-
-    fn current_timestamp_str() -> String {
-        let dt: DateTime<Utc> = SystemTime::now().into();
-        let dt_str = dt.format("%Y-%m-%d-%H-%M-%S").to_string();
-        dt_str
     }
 }
