@@ -340,6 +340,8 @@ impl RotatingFile {
 
         if all_have_created_time {
             debug!("sorting collected files by creation time");
+            // Unwrap safety: if `all_have_created_time` is true, then every timestamp value in the
+            // vec is `Some(_)`.
             results.sort_by_key(|(_, created)| created.unwrap());
         } else {
             warn!("failed to read metadata for at least one file; sorting collected files by name");
