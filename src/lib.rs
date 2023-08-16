@@ -268,19 +268,20 @@ impl RotatingFile {
             }
         }
 
-        if let Err(error) = guard.file.get_ref().sync_all() {
-            error!(path = ?guard.file_path, %error, "failed to sync metadata for current file");
-            if fail_fast {
-                return Err(CloseError::Sync(guard.file_path.clone(), error));
-            }
-        }
-
         // compress in a background thread
         if let Some(c) = self.compression {
             let file_path = guard.file_path.clone();
             let handles_clone = self.handles.clone();
             let handle = std::thread::spawn(move || Self::compress(file_path, c, handles_clone));
             self.handles.lock().unwrap().push(handle);
+        } else {
+            // no compression, we'll sync the original file
+            if let Err(error) = guard.file.get_ref().sync_all() {
+                error!(path = ?guard.file_path, %error, "failed to sync current file");
+                if fail_fast {
+                    return Err(CloseError::Sync(guard.file_path.clone(), error));
+                }
+            }
         }
 
         // wait for compression threads
@@ -296,6 +297,15 @@ impl RotatingFile {
         drop(handles);
 
         if compression_errors.is_empty() {
+            // Unwrap safety: A valid file path always has a parent path
+            let path = Path::new(&guard.file_path).parent().unwrap();
+            if let Err(error) = sync_dir(path) {
+                error!(path = ?guard.file_path.clone(), %error, "failed to sync parent directory");
+                if fail_fast {
+                    return Err(CloseError::Sync(guard.file_path.clone(), error));
+                }
+            }
+
             Ok(())
         } else {
             Err(CloseError::Compression(compression_errors))
@@ -354,13 +364,6 @@ impl RotatingFile {
             }
         }
 
-        if let Err(error) = guard.file.get_ref().sync_all() {
-            error!(path = ?guard.file_path, %error, "failed to sync metadata for completed file");
-            if fail_fast {
-                return Err(RotateError::Sync(guard.file_path.clone(), error));
-            }
-        }
-
         let old_file = guard.file_path.clone();
 
         let history_file = if let Some(c) = self.compression {
@@ -368,6 +371,13 @@ impl RotatingFile {
             history_file.push(c.extension());
             history_file
         } else {
+            // no compression, we'll sync the original file
+            if let Err(error) = guard.file.get_ref().sync_all() {
+                error!(path = ?guard.file_path, %error, "failed to sync completed file");
+                if fail_fast {
+                    return Err(RotateError::Sync(guard.file_path.clone(), error));
+                }
+            }
             old_file.clone()
         };
 
@@ -468,7 +478,7 @@ impl RotatingFile {
         let mut out_file_path = file.clone();
         out_file_path.push(compress.extension());
 
-        let out_file = fs::OpenOptions::new()
+        let mut out_file = fs::OpenOptions::new()
             .write(true)
             .create(true)
             .open(out_file_path.as_os_str())
@@ -477,15 +487,15 @@ impl RotatingFile {
                 CompressError::Open(out_file_path.clone(), error)
             })?;
 
-        let input_buf = fs::read(file.as_os_str()).map_err(|error| {
-            error!(path = ?file, %error, "failed to read input file for compression");
-            CompressError::Read(file.clone(), error)
+        let mut in_file = fs::File::open(file.as_os_str()).map_err(|error| {
+            error!(path = ?file, %error, "failed to open input file for compression");
+            CompressError::Open(file.clone(), error)
         })?;
 
         match compress {
             Compression::GZip => {
-                let mut encoder = GzEncoder::new(out_file, flate2::Compression::new(9));
-                encoder.write_all(&input_buf).map_err(|error| {
+                let mut encoder = GzEncoder::new(&mut out_file, flate2::Compression::default());
+                std::io::copy(&mut in_file, &mut encoder).map_err(|error| {
                     error!(path = ?out_file_path, %error, "failed to write compressed output to file");
                     CompressError::Write(out_file_path.clone(), error)
                 })?;
@@ -501,13 +511,13 @@ impl RotatingFile {
                     .unwrap()
                     .to_str()
                     .unwrap();
-                let mut zip = zip::ZipWriter::new(out_file);
+                let mut zip = zip::ZipWriter::new(&mut out_file);
                 zip.start_file(file_name, zip::write::FileOptions::default())
                     .map_err(|error| {
                         error!(path = ?file, %error, "failed to compress in zip format");
                         CompressError::Zip(file.clone(), error)
                     })?;
-                zip.write_all(&input_buf).map_err(|error| {
+                std::io::copy(&mut in_file, &mut zip).map_err(|error| {
                     error!(path = ?out_file_path, %error, "failed to write compressed output to file");
                     CompressError::Write(out_file_path.clone(), error)
                 })?;
@@ -518,10 +528,24 @@ impl RotatingFile {
             }
         }
 
-        let ret = fs::remove_file(file.as_os_str()).map_err(|error| {
-            error!(path = ?file, %error, "failed to remove compression input file");
-            CompressError::Remove(file.clone(), error)
-        });
+        let ret = (|| {
+            out_file.sync_all().map_err(|error| {
+                error!(path = ?out_file_path, %error, "failed to sync current file");
+                CompressError::Sync(file.clone(), error)
+            })?;
+
+            fs::remove_file(file.as_os_str()).map_err(|error| {
+                error!(path = ?file, %error, "failed to remove compression input file");
+                CompressError::Remove(file.clone(), error)
+            })?;
+
+            // Unwrap safety: A valid file path always has a parent path
+            let parent = Path::new(&file).parent().unwrap();
+            sync_dir(parent).map_err(|error| {
+                error!(path = ?out_file_path, %error, "failed to sync parent directory");
+                CompressError::Sync(file.clone(), error)
+            })
+        })();
 
         // remove from the handles vector
         if let Ok(ref mut guard) = handles.try_lock() {
@@ -595,6 +619,27 @@ impl Write for &RotatingFile {
 
     fn flush(&mut self) -> std::io::Result<()> {
         RotatingFile::flush(self)
+    }
+}
+
+fn sync_dir(path: &Path) -> std::io::Result<()> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        // On unix directory opens must be read only.
+        fs::File::open(path)?.sync_all()
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // On windows we must use FILE_FLAG_BACKUP_SEMANTICS to get a handle to the file
+        // From: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
+        const FILE_FLAG_BACKUP_SEMANTICS: i32 = 0x02000000;
+        use std::os::windows::fs::OpenOptionsExt;
+        fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+            .open(path)
+            .sync_all()
     }
 }
 

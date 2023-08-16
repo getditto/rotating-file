@@ -63,6 +63,9 @@ pub enum CompressError {
 
     #[error("failed to remove compression input file {0:?}: {1}")]
     Remove(OsString, #[source] io::Error),
+
+    #[error("failed to sync output file {0:?}: {1}")]
+    Sync(OsString, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
@@ -70,7 +73,7 @@ pub enum CloseError {
     #[error("failed to flush current file {0:?}: {1}")]
     Flush(OsString, #[source] io::Error),
 
-    #[error("failed to sync metadata for current file {0:?}: {1}")]
+    #[error("failed to sync current file {0:?}: {1}")]
     Sync(OsString, #[source] io::Error),
 
     #[error("at least one compression thread failed: {0:?}")]
