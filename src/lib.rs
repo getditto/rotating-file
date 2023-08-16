@@ -288,9 +288,7 @@ impl RotatingFile {
         let mut handles = self.handles.lock().unwrap();
         let mut compression_errors = vec![];
         for handle in handles.drain(..) {
-            let thread_id = handle.thread().id();
             if let Err(error) = handle.join().unwrap() {
-                error!(?thread_id, %error, "compression thread returned an error");
                 compression_errors.push(error);
             }
         }
@@ -487,7 +485,7 @@ impl RotatingFile {
             })?;
 
         let mut in_file = fs::File::open(file.as_os_str()).map_err(|error| {
-            error!(path = ?file, %error, "failed to open input file for compression");
+            warn!(path = ?file, %error, "failed to open input file for compression");
             CompressError::OpenInput(file.clone(), error)
         })?;
 
