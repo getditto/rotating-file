@@ -279,7 +279,7 @@ impl RotatingFile {
             if let Err(error) = guard.file.get_ref().sync_all() {
                 error!(path = ?guard.file_path, %error, "failed to sync current file");
                 if fail_fast {
-                    return Err(CloseError::Sync(guard.file_path.clone(), error));
+                    return Err(CloseError::SyncFile(guard.file_path.clone(), error));
                 }
             }
         }
@@ -302,7 +302,7 @@ impl RotatingFile {
             if let Err(error) = sync_dir(path) {
                 error!(path = ?guard.file_path.clone(), %error, "failed to sync parent directory");
                 if fail_fast {
-                    return Err(CloseError::Sync(guard.file_path.clone(), error));
+                    return Err(CloseError::SyncDir(guard.file_path.clone(), error));
                 }
             }
 
@@ -484,12 +484,12 @@ impl RotatingFile {
             .open(out_file_path.as_os_str())
             .map_err(|error| {
                 error!(path = ?out_file_path, %error, "failed to open output file for compression");
-                CompressError::Open(out_file_path.clone(), error)
+                CompressError::OpenOutput(out_file_path.clone(), error)
             })?;
 
         let mut in_file = fs::File::open(file.as_os_str()).map_err(|error| {
             error!(path = ?file, %error, "failed to open input file for compression");
-            CompressError::Open(file.clone(), error)
+            CompressError::OpenInput(file.clone(), error)
         })?;
 
         match compress {
@@ -531,7 +531,7 @@ impl RotatingFile {
         let ret = (|| {
             out_file.sync_all().map_err(|error| {
                 error!(path = ?out_file_path, %error, "failed to sync current file");
-                CompressError::Sync(file.clone(), error)
+                CompressError::SyncFile(file.clone(), error)
             })?;
 
             fs::remove_file(file.as_os_str()).map_err(|error| {
@@ -543,7 +543,7 @@ impl RotatingFile {
             let parent = Path::new(&file).parent().unwrap();
             sync_dir(parent).map_err(|error| {
                 error!(path = ?out_file_path, %error, "failed to sync parent directory");
-                CompressError::Sync(file.clone(), error)
+                CompressError::SyncDir(file.clone(), error)
             })
         })();
 

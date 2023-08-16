@@ -22,7 +22,7 @@ pub enum RotateError {
     #[error("failed to flush completed file {0:?}: {1}")]
     Flush(OsString, #[source] io::Error),
 
-    #[error("failed to sync metadata for completed file {0:?}: {1}")]
+    #[error("failed to sync completed file {0:?}: {1}")]
     Sync(OsString, #[source] io::Error),
 
     #[error("failed to remove completed file {0:?}: {1}")]
@@ -42,10 +42,10 @@ impl From<RotateError> for io::Error {
 #[derive(Error, Debug)]
 pub enum CompressError {
     #[error("failed to open output file {0:?} for compression: {1}")]
-    Open(OsString, #[source] io::Error),
+    OpenOutput(OsString, #[source] io::Error),
 
-    #[error("failed to read input file {0:?} for compression: {1}")]
-    Read(OsString, #[source] io::Error),
+    #[error("failed to open input file {0:?} for compression: {1}")]
+    OpenInput(OsString, #[source] io::Error),
 
     #[error("failed to write compressed output to file {0:?}: {1}")]
     Write(OsString, #[source] io::Error),
@@ -64,8 +64,11 @@ pub enum CompressError {
     #[error("failed to remove compression input file {0:?}: {1}")]
     Remove(OsString, #[source] io::Error),
 
-    #[error("failed to sync output file {0:?}: {1}")]
-    Sync(OsString, #[source] io::Error),
+    #[error("failed to sync file {0:?}: {1}")]
+    SyncFile(OsString, #[source] io::Error),
+
+    #[error("failed to sync directory {0:?}: {1}")]
+    SyncDir(OsString, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
@@ -73,8 +76,11 @@ pub enum CloseError {
     #[error("failed to flush current file {0:?}: {1}")]
     Flush(OsString, #[source] io::Error),
 
-    #[error("failed to sync current file {0:?}: {1}")]
-    Sync(OsString, #[source] io::Error),
+    #[error("failed to sync file {0:?}: {1}")]
+    SyncFile(OsString, #[source] io::Error),
+
+    #[error("failed to sync directory {0:?}: {1}")]
+    SyncDir(OsString, #[source] io::Error),
 
     #[error("at least one compression thread failed: {0:?}")]
     Compression(Vec<CompressError>),
