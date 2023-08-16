@@ -21,7 +21,7 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-use std::thread::JoinHandle;
+use std::sync::MutexGuard;
 use std::{collections::VecDeque, fmt, io::Write};
 use std::{
     ffi::OsString,
@@ -29,10 +29,10 @@ use std::{
 };
 use std::{fs, sync::Mutex};
 use std::{io::BufWriter, sync::Arc};
-use std::{
-    sync::MutexGuard,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::{thread::JoinHandle, time::Duration};
+
+#[cfg(not(target_arch = "wasm32"))]
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use chrono::{DateTime, NaiveDateTime, Utc};
 use flate2::write::GzEncoder;
@@ -426,10 +426,7 @@ impl RotatingFile {
         prefix: &str,
         suffix: &str,
     ) -> CurrentContext {
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = wall_clock().as_secs();
         let timestamp = if interval > 0 {
             now / interval * interval
         } else {
@@ -571,10 +568,7 @@ impl RotatingFile {
     pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         let mut guard = self.context.lock().unwrap();
 
-        let now = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = wall_clock().as_secs();
 
         if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
             || (self.interval > 0 && now >= (guard.timestamp + self.interval))
@@ -643,6 +637,17 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
             .open(path)
             .sync_all()
     }
+}
+
+/// Returns duration since unix epoch.
+pub fn wall_clock() -> Duration {
+    #[cfg(not(target_arch = "wasm32"))]
+    let val = SystemTime::now().duration_since(UNIX_EPOCH).unwrap();
+
+    #[cfg(target_arch = "wasm32")]
+    let val = Duration::from_millis(js_sys::Date::now() as u64);
+
+    val
 }
 
 #[cfg(test)]
