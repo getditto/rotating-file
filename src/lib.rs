@@ -677,7 +677,11 @@ fn sync_dir(path: &Path) -> std::io::Result<()> {
     {
         // On windows we must use FILE_FLAG_BACKUP_SEMANTICS to get a handle to the file
         // From: https://docs.microsoft.com/en-us/windows/win32/api/fileapi/nf-fileapi-createfilea
-        const FILE_FLAG_BACKUP_SEMANTICS: i32 = 0x02000000;
+        //
+        // Beware that `fs::OpenOptionsExt::custom_flags` takes a `u32` for the Windows
+        // implementation but an `i32` for the unix implementation.
+        // https://doc.rust-lang.org/std/os/windows/fs/trait.OpenOptionsExt.html#tymethod.custom_flags
+        const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x02000000;
         use std::os::windows::fs::OpenOptionsExt;
         fs::OpenOptions::new()
             .read(true)
