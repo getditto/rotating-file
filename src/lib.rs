@@ -257,6 +257,10 @@ impl RotatingFile {
         }
     }
 
+    pub fn root_dir(&self) -> &Path {
+        &self.root_dir
+    }
+
     pub fn close(&self) -> Result<(), CloseError> {
         self.close_inner(true)
     }
