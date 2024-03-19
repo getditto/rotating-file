@@ -28,7 +28,10 @@ use std::{
     path::{Path, PathBuf},
 };
 use std::{fs, sync::Mutex};
-use std::{io::BufWriter, sync::Arc};
+use std::{
+    io::{self, BufWriter},
+    sync::Arc,
+};
 use std::{thread::JoinHandle, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
@@ -38,6 +41,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use chrono::TimeZone;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use either::Either;
+use fail::fail_point;
 use flate2::write::GzEncoder;
 use tracing::{debug, error, warn};
 
@@ -46,6 +50,7 @@ use crate::errors::{
 };
 
 pub mod errors;
+pub mod failpoints;
 
 #[derive(Debug, Copy, Clone)]
 pub enum Compression {
@@ -266,8 +271,15 @@ impl RotatingFile {
     }
 
     fn close_inner(&self, fail_fast: bool) -> Result<(), CloseError> {
+        fail_point!(failpoints::LOCK_CONTEXT);
         let mut guard = self.context.lock().unwrap();
 
+        fail_point!(failpoints::FLUSH_CURRENT_FILE, |_| {
+            Err(CloseError::Flush(
+                guard.file_path.clone(),
+                io::Error::new(io::ErrorKind::Other, "failpoint error"),
+            ))
+        });
         if let Err(error) = guard.file.flush() {
             error!(path = ?guard.file_path, %error, "failed to flush current file");
             if fail_fast {
@@ -280,9 +292,17 @@ impl RotatingFile {
             let file_path = guard.file_path.clone();
             let handles_clone = self.handles.clone();
             let handle = std::thread::spawn(move || Self::compress(file_path, c, handles_clone));
+
+            fail_point!(failpoints::LOCK_COMPRESSION_HANDLE);
             self.handles.lock().unwrap().push(handle);
         } else {
             // no compression, we'll sync the original file
+            fail_point!(failpoints::SYNC_CURRENT_FILE, |_| {
+                Err(CloseError::SyncFile(
+                    guard.file_path.clone(),
+                    io::Error::new(io::ErrorKind::Other, "failpoint error"),
+                ))
+            });
             if let Err(error) = guard.file.get_ref().sync_all() {
                 error!(path = ?guard.file_path, %error, "failed to sync current file");
                 if fail_fast {
@@ -292,7 +312,9 @@ impl RotatingFile {
         }
 
         // wait for compression threads
+        fail_point!(failpoints::LOCK_COMPRESSION_HANDLE);
         let mut handles = self.handles.lock().unwrap();
+
         let mut compression_errors = vec![];
         for handle in handles.drain(..) {
             if let Err(error) = handle.join().unwrap() {
@@ -546,7 +568,7 @@ impl RotatingFile {
         match compress {
             Compression::GZip => {
                 let mut encoder = GzEncoder::new(&mut out_file, flate2::Compression::default());
-                std::io::copy(&mut in_file, &mut encoder).map_err(|error| {
+                io::copy(&mut in_file, &mut encoder).map_err(|error| {
                     error!(path = ?out_file_path, %error, "failed to write compressed output to file");
                     CompressError::Write(out_file_path.clone(), error)
                 })?;
@@ -568,7 +590,7 @@ impl RotatingFile {
                         error!(path = ?file, %error, "failed to compress in zip format");
                         CompressError::Zip(file.clone(), error)
                     })?;
-                std::io::copy(&mut in_file, &mut zip).map_err(|error| {
+                io::copy(&mut in_file, &mut zip).map_err(|error| {
                     error!(path = ?out_file_path, %error, "failed to write compressed output to file");
                     CompressError::Write(out_file_path.clone(), error)
                 })?;
@@ -617,7 +639,7 @@ impl Drop for RotatingFile {
 }
 
 impl RotatingFile {
-    pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
+    pub fn write(&self, buf: &[u8]) -> io::Result<usize> {
         let mut guard = self.context.lock().unwrap();
 
         let now = wall_clock().as_secs();
@@ -647,33 +669,33 @@ impl RotatingFile {
         }
     }
 
-    pub fn flush(&self) -> std::io::Result<()> {
+    pub fn flush(&self) -> io::Result<()> {
         let mut guard = self.context.lock().unwrap();
         guard.file.flush()
     }
 }
 
 impl Write for RotatingFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         RotatingFile::write(self, buf)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         RotatingFile::flush(self)
     }
 }
 
 impl Write for &RotatingFile {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
         RotatingFile::write(self, buf)
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    fn flush(&mut self) -> io::Result<()> {
         RotatingFile::flush(self)
     }
 }
 
-fn sync_dir(path: &Path) -> std::io::Result<()> {
+fn sync_dir(path: &Path) -> io::Result<()> {
     #[cfg(not(target_os = "windows"))]
     {
         // On unix directory opens must be read only.

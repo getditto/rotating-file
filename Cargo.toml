@@ -10,10 +10,12 @@ keywords = ["logging", "logrotate", "rotating"]
 
 [features]
 zip = ["dep:zip"]
+failpoints = ["fail/failpoints"]
 
 [dependencies]
 chrono = "0.4.19"
 either = "1.9.0"
+fail = "0.5.1"
 flate2 = "1.0.23"
 thiserror = "1.0.44"
 tracing = "0.1.37"
