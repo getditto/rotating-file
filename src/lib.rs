@@ -39,10 +39,11 @@ use chrono::TimeZone;
 use chrono::{DateTime, NaiveDateTime, Utc};
 use either::Either;
 use flate2::write::GzEncoder;
+use tap::{Conv, TapFallible};
 use tracing::{debug, error, warn};
 
 use crate::errors::{
-    BuilderFinishError, CloseError, CollectFilesError, CompressError, CutError, RotateError,
+    BuilderFinishError, CloseError, CollectFilesError, CompressError, CutError, ExportError, RotateError,
 };
 
 pub mod errors;
@@ -57,9 +58,9 @@ pub enum Compression {
 impl Compression {
     fn extension(self) -> &'static str {
         match self {
-            Compression::GZip => ".gz",
+            Compression::GZip => "gz",
             #[cfg(feature = "zip")]
-            Compression::Zip => ".zip",
+            Compression::Zip => "zip",
         }
     }
 }
@@ -85,7 +86,7 @@ struct CurrentContext {
     file_path: OsString,
     // list of paths to rotated or discovered log files on disk
     file_history: VecDeque<OsString>,
-    timestamp: u64,
+    timestamp: DateTime<Utc>,
     total_written: usize,
 }
 
@@ -207,17 +208,13 @@ impl RotatingFileBuilder {
         let prefix = self.prefix.unwrap_or_else(|| "".to_string());
         let suffix = self.suffix.unwrap_or_else(|| ".log".to_string());
 
-        let (files, file_history) = if let Some((limit, strategy)) = self.files {
-            match RotatingFile::collect_existing_files(&root_dir, &prefix, &suffix, strategy) {
-                Ok(existing_files) => (limit, existing_files),
-                Err(error) => {
-                    warn!(?root_dir, %error, "unable to collect existing files in root directory; ignoring");
-                    (limit, VecDeque::new())
-                }
-            }
-        } else {
-            (0, VecDeque::new())
-        };
+        let handles = Arc::new(Mutex::new(Vec::new()));
+
+        let (files, file_history) = self.files.and_then(|(limit, strategy)| {
+            RotatingFile::collect_existing_files(&root_dir, &prefix, &suffix, strategy, compression, &handles)
+                .tap_err(|error| warn!(?root_dir, %error, "unable to collect existing files in root directory; ignoring"))
+                .ok().zip(Some(limit))
+        }).map_or_else(|| (0, VecDeque::new()), |(existing_files, limit)| (limit, existing_files));
 
         let context = RotatingFile::create_context(
             interval,
@@ -238,7 +235,7 @@ impl RotatingFileBuilder {
             prefix,
             suffix,
             context: Mutex::new(context),
-            handles: Arc::new(Mutex::new(Vec::new())),
+            handles,
         })
     }
 }
@@ -322,6 +319,8 @@ impl RotatingFile {
         prefix: &str,
         suffix: &str,
         strategy: CleanupStrategy,
+        compression: Option<Compression>,
+        handles: &Arc<Mutex<Vec<JoinHandle<Result<OsString, CompressError>>>>>,
     ) -> Result<VecDeque<OsString>, CollectFilesError> {
         let mut all_have_created_time = true;
 
@@ -332,13 +331,23 @@ impl RotatingFile {
                 CleanupStrategy::MatchingFormat => {
                     let name = entry.file_name();
                     let name_str = name.to_string_lossy();
-                    name_str.starts_with(prefix) && name_str.ends_with(suffix)
+                    name_str.starts_with(prefix) && (name_str.ends_with(suffix) || name_str.ends_with(&format!("{suffix}.zip")) || name_str.ends_with(&format!("{suffix}.gz")))
                 }
                 CleanupStrategy::All => true,
             })
             .map(|entry| {
                 let created_time = entry.metadata().and_then(|meta| meta.created()).ok();
                 all_have_created_time &= created_time.is_some();
+
+                // Check if there are any files that are uncompressed and begin background
+                // compression threads for each of them
+                if let Some(compression) = compression {
+                    let file_path = entry.path();
+                    if file_path.extension() != Some(&compression.extension().to_owned().conv::<OsString>()) {
+                        let handle = std::thread::spawn(move || Self::compress(file_path, compression, handles.clone()));
+                        handles.lock().unwrap().push(handle);
+                    }
+                }
                 (entry, created_time)
             })
             .collect::<Vec<_>>();
@@ -373,6 +382,18 @@ impl RotatingFile {
         };
 
         Ok(file_path)
+    }
+
+    /// TODO: document
+    pub fn export<P: AsRef<Path>>(&self, dest: P) -> Result<u64, ExportError> {
+        let mut guard = self.context.lock().unwrap();
+
+        let file_path = match self.rotate(&mut guard, true)? {
+            Either::Left(uncompressed_path) => uncompressed_path,
+            Either::Right(compression_spawner) => compression_spawner().join().unwrap()?,
+        };
+
+
     }
 
     /// Initiates a rotation of the file.
@@ -416,6 +437,7 @@ impl RotatingFile {
 
         let history_file = if let Some(c) = self.compression {
             let mut history_file = old_file.clone();
+            history_file.push(".");
             history_file.push(c.extension());
             history_file
         } else {
@@ -478,26 +500,16 @@ impl RotatingFile {
         prefix: &str,
         suffix: &str,
     ) -> CurrentContext {
-        let now = wall_clock().as_secs();
-        let timestamp = if interval > 0 {
-            now / interval * interval
-        } else {
-            now
-        };
+        let timestamp = Utc::now();
+        let timestamp_str = timestamp.format(date_format).to_string();
 
-        let dt = DateTime::<Utc>::from_utc(
-            NaiveDateTime::from_timestamp_opt(timestamp as i64, 0).unwrap(),
-            Utc,
-        );
-        let dt_str = dt.format(date_format).to_string();
-
-        let mut file_name = format!("{}{}{}", prefix, dt_str, suffix);
+        let mut file_name = format!("{}{}{}", prefix, timestamp_str, suffix);
         let mut index = 1;
         while root_dir.join(file_name.as_str()).exists()
             || root_dir.join(file_name.clone() + ".gz").exists()
             || root_dir.join(file_name.clone() + ".zip").exists()
         {
-            file_name = format!("{}{}-{}{}", prefix, dt_str, index, suffix);
+            file_name = format!("{}{}-{}{}", prefix, timestamp_str, index, suffix);
             index += 1;
         }
 
@@ -527,11 +539,13 @@ impl RotatingFile {
         debug!(path = ?file, algorithm = %compress, ?thread_id, "compressing file");
 
         let mut out_file_path = file.clone();
+        out_file_path.push(".");
         out_file_path.push(compress.extension());
 
         let mut out_file = fs::OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(true)
             .open(out_file_path.as_os_str())
             .map_err(|error| {
                 error!(path = ?out_file_path, %error, "failed to open output file for compression");
@@ -620,10 +634,10 @@ impl RotatingFile {
     pub fn write(&self, buf: &[u8]) -> std::io::Result<usize> {
         let mut guard = self.context.lock().unwrap();
 
-        let now = wall_clock().as_secs();
+        let now = Utc::now();
 
         if (self.size > 0 && guard.total_written + buf.len() + 1 >= self.size * 1024)
-            || (self.interval > 0 && now >= (guard.timestamp + self.interval))
+            || (self.interval > 0 && now >= (guard.timestamp + Duration::from_secs(self.interval)))
         {
             if let Either::Right(thread_spawner) = self.rotate(&mut guard, true)? {
                 let handle = thread_spawner();
