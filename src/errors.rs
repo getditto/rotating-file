@@ -11,10 +11,26 @@ pub enum BuilderFinishError {
     CreateRootDir(PathBuf, #[source] io::Error),
 }
 
+impl BuilderFinishError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            BuilderFinishError::CreateRootDir(_, cause) => Some(cause),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CollectFilesError {
     #[error("failed to read contents of dir {0}: {1}")]
     ReadDir(PathBuf, #[source] io::Error),
+}
+
+impl CollectFilesError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            CollectFilesError::ReadDir(_, cause) => Some(cause),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -24,6 +40,15 @@ pub enum CutError {
 
     #[error(transparent)]
     Compress(#[from] CompressError),
+}
+
+impl CutError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            CutError::Rotate(source) => source.io_cause(),
+            CutError::Compress(source) => source.io_cause(),
+        }
+    }
 }
 
 #[derive(Error, Debug)]
@@ -36,6 +61,16 @@ pub enum RotateError {
 
     #[error("failed to remove completed file {0:?}: {1}")]
     Remove(OsString, #[source] io::Error),
+}
+
+impl RotateError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            RotateError::Flush(_, cause) => Some(cause),
+            RotateError::Sync(_, cause) => Some(cause),
+            RotateError::Remove(_, cause) => Some(cause),
+        }
+    }
 }
 
 impl From<RotateError> for io::Error {
@@ -80,6 +115,24 @@ pub enum CompressError {
     SyncDir(OsString, #[source] io::Error),
 }
 
+impl CompressError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            CompressError::OpenOutput(_, cause) => Some(cause),
+            CompressError::OpenInput(_, cause) => Some(cause),
+            CompressError::Write(_, cause) => Some(cause),
+            CompressError::FlushGZip(_, cause) => Some(cause),
+            #[cfg(feature = "zip")]
+            CompressError::Zip(_, _) => None,
+            #[cfg(feature = "zip")]
+            CompressError::FinishZip(_, _) => None,
+            CompressError::Remove(_, cause) => Some(cause),
+            CompressError::SyncFile(_, cause) => Some(cause),
+            CompressError::SyncDir(_, cause) => Some(cause),
+        }
+    }
+}
+
 #[derive(Error, Debug)]
 pub enum CloseError {
     #[error("failed to flush current file {0:?}: {1}")]
@@ -93,4 +146,15 @@ pub enum CloseError {
 
     #[error("at least one compression thread failed: {0:?}")]
     Compression(Vec<CompressError>),
+}
+
+impl CloseError {
+    pub fn io_cause(&self) -> Option<&io::Error> {
+        match self {
+            CloseError::Flush(_, cause) => Some(cause),
+            CloseError::SyncFile(_, cause) => Some(cause),
+            CloseError::SyncDir(_, cause) => Some(cause),
+            CloseError::Compression(errors) => errors.first().and_then(|err| err.io_cause()),
+        }
+    }
 }
