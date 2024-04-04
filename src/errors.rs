@@ -12,7 +12,7 @@ pub enum BuilderFinishError {
 }
 
 impl BuilderFinishError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             BuilderFinishError::CreateRootDir(_, cause) => Some(cause),
         }
@@ -26,7 +26,7 @@ pub enum CollectFilesError {
 }
 
 impl CollectFilesError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             CollectFilesError::ReadDir(_, cause) => Some(cause),
         }
@@ -43,7 +43,7 @@ pub enum CutError {
 }
 
 impl CutError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             CutError::Rotate(source) => source.io_cause(),
             CutError::Compress(source) => source.io_cause(),
@@ -64,7 +64,7 @@ pub enum RotateError {
 }
 
 impl RotateError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             RotateError::Flush(_, cause) => Some(cause),
             RotateError::Sync(_, cause) => Some(cause),
@@ -116,7 +116,7 @@ pub enum CompressError {
 }
 
 impl CompressError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             CompressError::OpenOutput(_, cause) => Some(cause),
             CompressError::OpenInput(_, cause) => Some(cause),
@@ -149,12 +149,14 @@ pub enum CloseError {
 }
 
 impl CloseError {
-    pub fn io_cause(&self) -> Option<&io::Error> {
+    pub fn io_cause(self) -> Option<io::Error> {
         match self {
             CloseError::Flush(_, cause) => Some(cause),
             CloseError::SyncFile(_, cause) => Some(cause),
             CloseError::SyncDir(_, cause) => Some(cause),
-            CloseError::Compression(errors) => errors.first().and_then(|err| err.io_cause()),
+            CloseError::Compression(errors) => {
+                errors.into_iter().next().and_then(|err| err.io_cause())
+            }
         }
     }
 }
