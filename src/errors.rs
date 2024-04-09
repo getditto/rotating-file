@@ -1,14 +1,17 @@
 use std::{ffi::OsString, io, path::PathBuf};
 
-#[cfg(feature = "zip")]
-use zip::result::ZipError;
-
 use thiserror::Error;
 
 #[derive(Error, Debug)]
-pub enum BuilderFinishError {
+pub enum NewError {
     #[error("failed to create root directory {0}: {1}")]
     CreateRootDir(PathBuf, #[source] io::Error),
+
+    #[error(transparent)]
+    CollectExistingFiles(#[from] CollectFilesError),
+
+    #[error(transparent)]
+    NewFile(#[from] NewFileError),
 }
 
 #[derive(Error, Debug)]
@@ -22,13 +25,23 @@ pub enum CutError {
     #[error(transparent)]
     Rotate(#[from] RotateError),
 
-    #[error(transparent)]
-    Compress(#[from] CompressError),
+    #[error("at least one compression task failed: {0:?}")]
+    Compression(Vec<CompressError>),
 }
 
 #[derive(Error, Debug)]
 pub enum ExportError {
+    #[error(transparent)]
+    Rotate(#[from] RotateError),
 
+    #[error(transparent)]
+    Compress(#[from] CompressError),
+
+    #[error("failed to open output file {0:?} for export: {1}")]
+    OpenOutput(OsString, #[source] io::Error),
+
+    #[error("failed to copy data to output file {0:?} for export: {1}")]
+    Copy(OsString, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
@@ -41,6 +54,9 @@ pub enum RotateError {
 
     #[error("failed to remove completed file {0:?}: {1}")]
     Remove(OsString, #[source] io::Error),
+
+    #[error(transparent)]
+    NewFile(#[from] NewFileError),
 }
 
 impl From<RotateError> for io::Error {
@@ -49,6 +65,21 @@ impl From<RotateError> for io::Error {
             RotateError::Flush(_, err) => err,
             RotateError::Sync(_, err) => err,
             RotateError::Remove(_, err) => err,
+            RotateError::NewFile(err) => err.into(),
+        }
+    }
+}
+
+#[derive(Error, Debug)]
+pub enum NewFileError {
+    #[error("failed to open new output file {0:?}: {1}")]
+    Open(OsString, #[source] io::Error),
+}
+
+impl From<NewFileError> for io::Error {
+    fn from(err: NewFileError) -> Self {
+        match err {
+            NewFileError::Open(_, err) => err,
         }
     }
 }
@@ -66,14 +97,6 @@ pub enum CompressError {
 
     #[error("failed to flush gzip-compressed output file {0:?}: {1}")]
     FlushGZip(OsString, #[source] io::Error),
-
-    #[cfg(feature = "zip")]
-    #[error("failed to compress input file {0:?} in zip format: {1}")]
-    Zip(OsString, #[source] ZipError),
-
-    #[cfg(feature = "zip")]
-    #[error("failed to finish writing zip-compressed output file {0:?}: {1}")]
-    FinishZip(OsString, #[source] ZipError),
 
     #[error("failed to remove compression input file {0:?}: {1}")]
     Remove(OsString, #[source] io::Error),
