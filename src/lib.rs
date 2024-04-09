@@ -54,8 +54,11 @@ use crate::errors::{
     RotateError,
 };
 
+/// The suffix that will be present in any filename for a file that has been compressed.
 const COMPRESSED_SUFFIX: &'static str = "gz";
 
+/// The date format used when writing timestamps into the names of log files with
+/// [chrono](https://docs.rs/chrono/latest/chrono/format/strftime/).
 const DATE_FORMAT: &'static str = "%Y-%m-%d-%H-%M-%S%.6f";
 
 pub mod errors;
