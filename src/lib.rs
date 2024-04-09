@@ -72,7 +72,7 @@ pub struct RotatingFile {
 }
 
 impl RotatingFile {
-    pub fn try_new(storage: Storage, limits: Limits) -> Result<Self, NewError> {
+    pub fn try_init(storage: Storage, limits: Limits) -> Result<Self, NewError> {
         let output_file = Self::open_new_file(&storage.root_dir, &storage.prefix)?;
 
         let mut selph = Self {
