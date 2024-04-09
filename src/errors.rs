@@ -18,6 +18,12 @@ pub enum NewError {
 pub enum CollectFilesError {
     #[error("failed to read contents of dir {0}: {1}")]
     ReadDir(PathBuf, #[source] io::Error),
+
+    #[error("failed to read dir entry: {0}")]
+    ReadDirEntry(#[source] io::Error),
+
+    #[error("failed to access metadata of filesystem entity at path {0}: {1}")]
+    AccessMetadata(PathBuf, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
