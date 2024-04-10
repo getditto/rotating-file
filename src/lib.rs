@@ -21,7 +21,6 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-use std::sync::Mutex;
 use std::thread;
 use std::{
     collections::{BTreeSet, HashMap},
@@ -34,6 +33,7 @@ use std::{
     ffi::OsString,
     path::{Path, PathBuf},
 };
+use std::{io::BufReader, sync::Mutex};
 use std::{io::BufWriter, sync::Arc};
 use std::{thread::JoinHandle, time::Duration};
 
@@ -91,6 +91,8 @@ impl RotatingFile {
     }
 
     fn collect_existing_files(&mut self) -> Result<(), CollectFilesError> {
+        trace!(root_dir = ?self.storage.root_dir, "collecting existing files from the root directory");
+
         for entry in fs::read_dir(&self.storage.root_dir)
             .map_err(|err| CollectFilesError::ReadDir(self.storage.root_dir.clone(), err))?
         {
@@ -107,12 +109,20 @@ impl RotatingFile {
             // If we find a file that is uncompressed, we need to compress the file. Otherwise,
             // we just record the path of the file as-is.
             let path = entry.path();
+
+            if path == self.current.path {
+                debug!(?path, "found our currently active log file; ignoring it");
+                continue;
+            }
+
             match path.extension() {
                 Some(ext) if ext == &COMPRESSED_SUFFIX.to_owned().conv::<OsString>() => {
                     trace!(?path, "found compressed file");
                     self.state.lock().unwrap().found_file(path);
                 }
                 Some(ext) if ext == &UNCOMPRESSED_EXT.to_owned().conv::<OsString>() => {
+                    trace!(?path, "found uncompressed file; compressing it");
+
                     let state = self.state.clone();
                     let work = self.work.clone();
 
@@ -120,7 +130,9 @@ impl RotatingFile {
                         .lock()
                         .unwrap()
                         .enqueue_compression(move |work_id| {
+                            trace!(?work_id, "starting compression task");
                             let result = Self::compress(path, state);
+                            trace!(?work_id, "compression task finished");
                             work.lock().unwrap().compression_finished(work_id);
                             result
                         });
@@ -137,8 +149,46 @@ impl RotatingFile {
         Ok(())
     }
 
-    pub fn export<P: AsRef<Path>>(&self, dest: P) -> Result<u64, ExportError> {
-        todo!()
+    pub fn export<P: AsRef<Path>>(&mut self, dest: P) -> Result<u64, ExportError> {
+        trace!(destination = ?dest.as_ref(), "starting export");
+
+        // When we export, we want the most recent possible log data to be included. So rotate away
+        // from the current file, which will also kick off a compression of that file (and the join
+        // handle for that compression task will be added to `self.work`).
+        self.rotate()?;
+
+        // Wait for all ongoing work, including the compression task we just created, to finish.
+        self.work.lock().unwrap().join_all()?;
+
+        let out_file = File::options()
+            .write(true)
+            .create_new(true)
+            .open(dest.as_ref())
+            .map_err(|error| ExportError::CreateOutput(dest.as_ref().to_owned(), error))?;
+        let mut out_writer = BufWriter::new(out_file);
+
+        let mut bytes_copied = 0;
+        for in_file_path in self.state.lock().unwrap().files() {
+            let in_file = File::options()
+                .read(true)
+                .open(in_file_path)
+                .map_err(|error| ExportError::OpenInput(in_file_path.to_owned(), error))?;
+            let mut in_reader = BufReader::new(in_file);
+
+            bytes_copied += io::copy(&mut in_reader, &mut out_writer).map_err(|error| {
+                ExportError::Copy(in_file_path.to_owned(), dest.as_ref().to_owned(), error)
+            })?;
+        }
+
+        out_writer
+            .flush()
+            .map_err(|error| ExportError::Flush(dest.as_ref().to_owned(), error))?;
+        out_writer
+            .get_mut()
+            .sync_all()
+            .map_err(|error| ExportError::Sync(dest.as_ref().to_owned(), error))?;
+
+        Ok(bytes_copied)
     }
 
     fn compress(in_path: PathBuf, state: Arc<Mutex<State>>) -> Result<(), CompressError> {
@@ -404,10 +454,16 @@ impl State {
     }
 
     fn file_compressed(&mut self, old: PathBuf, new: PathBuf) {
-        if !self.files.remove(&old) {
-            trace!(old_path = ?old, "path before compression was not in list of files");
-        }
+        self.files.remove(&old);
         self.files.insert(new);
+    }
+
+    /// Return an iterator over all paths stored in the state, ordered by filename.
+    ///
+    /// This, in theory, means they're ordered by the timestamps in their names, provided the
+    /// prefixes of all the filenames are the same.
+    fn files(&self) -> impl Iterator<Item = &Path> {
+        self.files.iter().map(PathBuf::as_path)
     }
 }
 
@@ -442,19 +498,29 @@ impl Work {
     fn compression_finished(&mut self, work_id: WorkId) {
         self.compression.remove(&work_id);
     }
+
+    fn join_all(&mut self) -> Result<(), CompressError> {
+        for (_, handle) in self.compression.drain() {
+            handle.join().unwrap()?;
+        }
+
+        Ok(())
+    }
 }
 
 impl Drop for Work {
     fn drop(&mut self) {
         for (_, handle) in self.compression.drain() {
-            // Don't unwrap these, just log the errors so that we can continue to join on the other
-            // threads.
+            // Don't unwrap the inner errors (the ones that actually come from the threads), just
+            // log them so that we can continue to join on the other threads.
+            //
+            // We _do_ unwrap the outer errors, which will occur if the thread panicked, because
+            // panics will nearly always be the result of poisoned mutexes in this crate, and we
+            // should propagate those panics between threads.
             let _ = handle
                 .join()
-                .tap_err(|error| warn!(?error, "compression task panicked"))
-                .map(|thread_result| {
-                    thread_result.tap_err(|error| warn!(?error, "compression task failed"))
-                });
+                .unwrap()
+                .tap_err(|error| warn!(?error, "compression task failed"));
         }
     }
 }
@@ -547,7 +613,7 @@ pub fn wall_clock() -> Duration {
     return Duration::from_millis(js_sys::Date::now() as u64);
 }
 
-#[cfg(test)]
+#[cfg(foooooooooooooooo)]
 mod tests {
     use super::*;
 

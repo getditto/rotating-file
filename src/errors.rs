@@ -40,14 +40,23 @@ pub enum ExportError {
     #[error(transparent)]
     Rotate(#[from] RotateError),
 
-    #[error(transparent)]
-    Compress(#[from] CompressError),
+    #[error("a compression task failed: {0}")]
+    Compression(#[from] CompressError),
 
-    #[error("failed to open output file {0:?} for export: {1}")]
-    OpenOutput(PathBuf, #[source] io::Error),
+    #[error("failed to create output file {0:?} for export: {1}")]
+    CreateOutput(PathBuf, #[source] io::Error),
 
-    #[error("failed to copy data to output file {0:?} for export: {1}")]
-    Copy(PathBuf, #[source] io::Error),
+    #[error("failed to read input file {0:?} for export: {1}")]
+    OpenInput(PathBuf, #[source] io::Error),
+
+    #[error("failed to copy data from input file {0:?} to output file {1:?} for export: {2}")]
+    Copy(PathBuf, PathBuf, #[source] io::Error),
+
+    #[error("failed to flush output file {0:?}: {1}")]
+    Flush(PathBuf, #[source] io::Error),
+
+    #[error("failed to sync output file {0:?}: {1}")]
+    Sync(PathBuf, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
