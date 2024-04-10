@@ -45,7 +45,7 @@ use chrono::TimeZone;
 use chrono::{DateTime, TimeDelta, Utc};
 use flate2::{write::GzEncoder, Compression};
 use tap::{Conv, TapFallible};
-use tracing::{debug, error, trace, warn};
+use tracing::{debug, error, instrument::Instrumented, trace, warn, Instrument};
 
 use crate::errors::{
     CloseError, CollectFilesError, CompressError, CutError, ExportError, NewError, NewFileError,
@@ -158,7 +158,13 @@ impl RotatingFile {
         self.rotate()?;
 
         // Wait for all ongoing work, including the compression task we just created, to finish.
-        self.work.lock().unwrap().join_all()?;
+        let mut work_guard = self.work.lock().unwrap();
+        let handles = work_guard.drain_handles();
+        drop(work_guard);
+
+        for handle in handles {
+            handle.into_inner().join().unwrap()?;
+        }
 
         let out_file = File::options()
             .write(true)
@@ -472,7 +478,7 @@ struct WorkId(ThreadId);
 
 #[derive(Debug, Default)]
 struct Work {
-    compression: HashMap<WorkId, JoinHandle<Result<(), CompressError>>>,
+    compression: HashMap<WorkId, Instrumented<JoinHandle<Result<(), CompressError>>>>,
 }
 
 impl Work {
@@ -489,8 +495,9 @@ impl Work {
         let handle = thread::spawn(move || {
             let id = WorkId(thread::current().id());
             work(id)
-        });
-        let id = WorkId(handle.thread().id());
+        })
+        .in_current_span();
+        let id = WorkId(handle.inner().thread().id());
         self.compression.insert(id, handle);
         id
     }
@@ -499,17 +506,16 @@ impl Work {
         self.compression.remove(&work_id);
     }
 
-    fn join_all(&mut self) -> Result<(), CompressError> {
-        for (_, handle) in self.compression.drain() {
-            handle.join().unwrap()?;
-        }
-
-        Ok(())
+    fn drain_handles(&mut self) -> Vec<Instrumented<JoinHandle<Result<(), CompressError>>>> {
+        self.compression.drain().map(|(_, handle)| handle).collect()
     }
 }
 
 impl Drop for Work {
     fn drop(&mut self) {
+        // FIXME: fix the serious deadlock here because we have a &mut self, but all the threads
+        // will want to lock our mutex
+
         for (_, handle) in self.compression.drain() {
             // Don't unwrap the inner errors (the ones that actually come from the threads), just
             // log them so that we can continue to join on the other threads.
@@ -518,6 +524,7 @@ impl Drop for Work {
             // panics will nearly always be the result of poisoned mutexes in this crate, and we
             // should propagate those panics between threads.
             let _ = handle
+                .into_inner()
                 .join()
                 .unwrap()
                 .tap_err(|error| warn!(?error, "compression task failed"));
