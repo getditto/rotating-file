@@ -1,4 +1,4 @@
-use std::{ffi::OsString, io, path::PathBuf};
+use std::{io, path::PathBuf};
 
 use thiserror::Error;
 
@@ -44,22 +44,22 @@ pub enum ExportError {
     Compress(#[from] CompressError),
 
     #[error("failed to open output file {0:?} for export: {1}")]
-    OpenOutput(OsString, #[source] io::Error),
+    OpenOutput(PathBuf, #[source] io::Error),
 
     #[error("failed to copy data to output file {0:?} for export: {1}")]
-    Copy(OsString, #[source] io::Error),
+    Copy(PathBuf, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum RotateError {
     #[error("failed to flush completed file {0:?}: {1}")]
-    Flush(OsString, #[source] io::Error),
+    Flush(PathBuf, #[source] io::Error),
 
     #[error("failed to sync completed file {0:?}: {1}")]
-    Sync(OsString, #[source] io::Error),
+    Sync(PathBuf, #[source] io::Error),
 
     #[error("failed to remove completed file {0:?}: {1}")]
-    Remove(OsString, #[source] io::Error),
+    Remove(PathBuf, #[source] io::Error),
 
     #[error(transparent)]
     NewFile(#[from] NewFileError),
@@ -79,7 +79,7 @@ impl From<RotateError> for io::Error {
 #[derive(Error, Debug)]
 pub enum NewFileError {
     #[error("failed to open new output file {0:?}: {1}")]
-    Open(OsString, #[source] io::Error),
+    Open(PathBuf, #[source] io::Error),
 }
 
 impl From<NewFileError> for io::Error {
@@ -93,37 +93,37 @@ impl From<NewFileError> for io::Error {
 #[derive(Error, Debug)]
 pub enum CompressError {
     #[error("failed to open output file {0:?} for compression: {1}")]
-    OpenOutput(OsString, #[source] io::Error),
+    OpenOutput(PathBuf, #[source] io::Error),
 
     #[error("failed to open input file {0:?} for compression: {1}")]
-    OpenInput(OsString, #[source] io::Error),
+    OpenInput(PathBuf, #[source] io::Error),
 
     #[error("failed to write compressed output to file {0:?}: {1}")]
-    Write(OsString, #[source] io::Error),
+    Write(PathBuf, #[source] io::Error),
 
     #[error("failed to flush gzip-compressed output file {0:?}: {1}")]
-    FlushGZip(OsString, #[source] io::Error),
+    FlushGZip(PathBuf, #[source] io::Error),
 
     #[error("failed to remove compression input file {0:?}: {1}")]
-    Remove(OsString, #[source] io::Error),
+    Remove(PathBuf, #[source] io::Error),
 
     #[error("failed to sync file {0:?}: {1}")]
-    SyncFile(OsString, #[source] io::Error),
+    SyncFile(PathBuf, #[source] io::Error),
 
     #[error("failed to sync directory {0:?}: {1}")]
-    SyncDir(OsString, #[source] io::Error),
+    SyncDir(PathBuf, #[source] io::Error),
 }
 
 #[derive(Error, Debug)]
 pub enum CloseError {
     #[error("failed to flush current file {0:?}: {1}")]
-    Flush(OsString, #[source] io::Error),
+    Flush(PathBuf, #[source] io::Error),
 
     #[error("failed to sync file {0:?}: {1}")]
-    SyncFile(OsString, #[source] io::Error),
+    SyncFile(PathBuf, #[source] io::Error),
 
     #[error("failed to sync directory {0:?}: {1}")]
-    SyncDir(OsString, #[source] io::Error),
+    SyncDir(PathBuf, #[source] io::Error),
 
     #[error("at least one compression thread failed: {0:?}")]
     Compression(Vec<CompressError>),

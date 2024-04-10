@@ -21,8 +21,6 @@
 //! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
 
-#![allow(unreachable_code)]
-
 use std::sync::Mutex;
 use std::thread;
 use std::{
@@ -112,7 +110,7 @@ impl RotatingFile {
             match path.extension() {
                 Some(ext) if ext == &COMPRESSED_SUFFIX.to_owned().conv::<OsString>() => {
                     trace!(?path, "found compressed file");
-                    self.state.lock().unwrap().found_file(path.into_os_string());
+                    self.state.lock().unwrap().found_file(path);
                 }
                 Some(ext) if ext == &UNCOMPRESSED_EXT.to_owned().conv::<OsString>() => {
                     let state = self.state.clone();
@@ -158,7 +156,7 @@ impl RotatingFile {
 
         let mut in_file = File::open(&in_path).map_err(|error| {
             warn!(path = ?in_path, %error, "failed to open input file for compression");
-            CompressError::OpenInput(in_path.clone().into_os_string(), error)
+            CompressError::OpenInput(in_path.clone(), error)
         })?;
 
         let mut out_file = File::options()
@@ -168,41 +166,38 @@ impl RotatingFile {
             .open(&out_path)
             .map_err(|error| {
                 error!(path = ?out_path, %error, "failed to open output file for compression");
-                CompressError::OpenOutput(out_path.clone().into_os_string(), error)
+                CompressError::OpenOutput(out_path.clone(), error)
             })?;
 
         let mut encoder = GzEncoder::new(&mut out_file, Compression::default());
         io::copy(&mut in_file, &mut encoder).map_err(|error| {
             error!(path = ?out_path, %error, "failed to write compressed output to file");
-            CompressError::Write(out_path.clone().into_os_string(), error)
+            CompressError::Write(out_path.clone(), error)
         })?;
         encoder.flush().map_err(|error| {
             error!(path = ?out_path, %error, "failed to flush compressed output file");
-            CompressError::FlushGZip(out_path.clone().into_os_string(), error)
+            CompressError::FlushGZip(out_path.clone(), error)
         })?;
 
         drop(encoder);
         out_file.sync_all().map_err(|error| {
             error!(path = ?out_path, %error, "failed to sync compressed output file");
-            CompressError::SyncFile(out_path.clone().into_os_string(), error)
+            CompressError::SyncFile(out_path.clone(), error)
         })?;
 
         fs::remove_file(&in_path).map_err(|error| {
             error!(path = ?in_path, %error, "failed to remove compression input file");
-            CompressError::Remove(in_path.clone().into_os_string(), error)
+            CompressError::Remove(in_path.clone(), error)
         })?;
 
         // Unwrap safety: A valid file path always has a parent path
         let parent = Path::new(&in_path).parent().unwrap();
         sync_dir(parent).map_err(|error| {
             error!(path = ?parent, %error, "failed to sync parent directory");
-            CompressError::SyncDir(parent.to_owned().into_os_string(), error)
+            CompressError::SyncDir(parent.to_owned(), error)
         })?;
 
-        state
-            .lock()
-            .unwrap()
-            .file_compressed(in_path.into_os_string(), out_path.into_os_string());
+        state.lock().unwrap().file_compressed(in_path, out_path);
 
         Ok(())
     }
@@ -210,18 +205,12 @@ impl RotatingFile {
     fn rotate(&mut self) -> Result<(), RotateError> {
         if let Err(error) = self.current.file.flush() {
             error!(path = ?self.current.path, %error, "failed to flush current file");
-            return Err(RotateError::Flush(
-                self.current.path.clone().into_os_string(),
-                error,
-            ));
+            return Err(RotateError::Flush(self.current.path.clone(), error));
         }
 
         if let Err(error) = self.current.file.get_mut().sync_all() {
             error!(path = ?self.current.path, %error, "failed to sync current file");
-            return Err(RotateError::Sync(
-                self.current.path.clone().into_os_string(),
-                error,
-            ));
+            return Err(RotateError::Sync(self.current.path.clone(), error));
         }
 
         if let Some(max_files) = self.limits.files {
@@ -275,7 +264,7 @@ impl RotatingFile {
             .open(&new_path)
             .map_err(|error| {
                 error!(path = ?new_path, %error, "failed to open new output file");
-                NewFileError::Open(new_path.clone().into_os_string(), error)
+                NewFileError::Open(new_path.clone(), error)
             })?;
 
         Ok(Current {
@@ -406,15 +395,15 @@ impl Drop for Current {
 
 #[derive(Debug, Clone, Default)]
 struct State {
-    files: BTreeSet<OsString>,
+    files: BTreeSet<PathBuf>,
 }
 
 impl State {
-    fn found_file(&mut self, path: OsString) {
+    fn found_file(&mut self, path: PathBuf) {
         self.files.insert(path);
     }
 
-    fn file_compressed(&mut self, old: OsString, new: OsString) {
+    fn file_compressed(&mut self, old: PathBuf, new: PathBuf) {
         if !self.files.remove(&old) {
             trace!(old_path = ?old, "path before compression was not in list of files");
         }
