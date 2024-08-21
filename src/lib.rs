@@ -3,36 +3,40 @@
 //! ## Example
 //!
 //! ```
-//! use rotating_file::RotatingFile;
 //! use std::io::Write;
 //!
-//! let root_dir = "./target/tmp";
+//! use rotating_file::RotatingFile;
+//! use tempfile::tempdir;
+//!
+//! let root_dir_handle = tempdir().unwrap();
+//! let root_dir = root_dir_handle.path();
 //! let s = "The quick brown fox jumps over the lazy dog";
-//! let _ = std::fs::remove_dir_all(root_dir);
 //!
 //! // rotated by 1 kilobyte, compressed with gzip
-//! let mut rotating_file = RotatingFile::build(root_dir.into()).size(1).finish().unwrap();
+//! let mut rotating_file = RotatingFile::build(root_dir.to_owned())
+//!     .size(1)
+//!     .finish()
+//!     .unwrap();
 //! for _ in 0..24 {
 //!     writeln!(rotating_file, "{}", s).unwrap();
 //! }
 //! rotating_file.close();
 //!
 //! assert_eq!(2, std::fs::read_dir(root_dir).unwrap().count());
-//! std::fs::remove_dir_all(root_dir).unwrap();
 //! ```
-
-use std::sync::MutexGuard;
-use std::{collections::VecDeque, fmt, io::Write};
-use std::{
-    ffi::OsString,
-    path::{Path, PathBuf},
-};
-use std::{fs, sync::Mutex};
-use std::{io::BufWriter, sync::Arc};
-use std::{thread::JoinHandle, time::Duration};
 
 #[cfg(not(target_arch = "wasm32"))]
 use std::time::{SystemTime, UNIX_EPOCH};
+use std::{
+    collections::VecDeque,
+    ffi::OsString,
+    fmt, fs,
+    io::{BufWriter, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, MutexGuard},
+    thread::JoinHandle,
+    time::Duration,
+};
 
 #[cfg(test)]
 use chrono::TimeZone;
@@ -763,21 +767,21 @@ pub fn wall_clock() -> Duration {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::{io::Write, ops::Not, path::PathBuf, sync::Mutex, time::Duration};
 
     use once_cell::sync::Lazy;
     use serial_test::serial;
-    use std::time::Duration;
-    use std::{io::Write, sync::Mutex};
-    use std::{ops::Not, path::PathBuf};
+    use tempfile::tempdir;
+
+    use super::*;
 
     const TEXT: &'static str = "The quick brown fox jumps over the lazy dog";
 
     #[test]
     #[serial(mock_time)]
     fn rotate_by_size() {
-        let root_dir = PathBuf::from("./target/tmp1");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
@@ -814,15 +818,13 @@ mod tests {
             format!("{}\n", TEXT),
             std::fs::read_to_string(root_dir.join(timestamp + "-1.log")).unwrap()
         );
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn rotate_by_time() {
-        let root_dir = PathBuf::from("./target/tmp2");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .finish()
@@ -840,15 +842,13 @@ mod tests {
 
         assert!(root_dir.join(timestamp1 + ".log").exists());
         assert!(root_dir.join(timestamp2 + ".log").exists());
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn rotate_by_size_and_gzip() {
-        let root_dir = PathBuf::from("./target/tmp3");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
@@ -864,16 +864,14 @@ mod tests {
 
         assert!(root_dir.join(timestamp.clone() + ".log.gz").exists());
         assert!(root_dir.join(timestamp + "-1.log.gz").exists());
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[cfg(feature = "zip")]
     #[test]
     #[serial(mock_time)]
     fn rotate_by_size_and_zip() {
-        let root_dir = PathBuf::from("./target/tmp4");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
@@ -889,15 +887,13 @@ mod tests {
 
         assert!(root_dir.join(timestamp.clone() + ".log.zip").exists());
         assert!(root_dir.join(timestamp + "-1.log.zip").exists());
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn rotate_by_time_and_gzip() {
-        let root_dir = PathBuf::from("./target/tmp5");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .compression(Compression::GZip)
@@ -916,16 +912,14 @@ mod tests {
 
         assert!(root_dir.join(timestamp1 + ".log.gz").exists());
         assert!(root_dir.join(timestamp2 + ".log.gz").exists());
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[cfg(feature = "zip")]
     #[test]
     #[serial(mock_time)]
     fn rotate_by_time_and_zip() {
-        let root_dir = PathBuf::from("./target/tmp6");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .compression(Compression::Zip)
@@ -944,15 +938,13 @@ mod tests {
 
         assert!(root_dir.join(timestamp1 + ".log.zip").exists());
         assert!(root_dir.join(timestamp2 + ".log.zip").exists());
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn rotate_by_max_files() {
-        let root_dir = PathBuf::from("./target/tmp7");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .interval(1)
             .files(2, CleanupStrategy::All)
@@ -980,8 +972,6 @@ mod tests {
         assert!(root_dir.join(timestamp3 + ".log").exists());
 
         rotating_file.close().expect("able to close rotating file");
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
@@ -996,7 +986,6 @@ mod tests {
                     .expect("able to build rotating file"),
             )
         });
-        let _ = std::fs::remove_dir_all(&*ROOT_DIR);
 
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let handle1 = std::thread::spawn(move || {
@@ -1032,15 +1021,13 @@ mod tests {
             TEXT.len() + 1,
             std::fs::metadata(third_file).unwrap().len() as usize
         );
-
-        std::fs::remove_dir_all(&*ROOT_DIR).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn clean_up_existing_matching_name() {
-        let root_dir = PathBuf::from("./target/tmp9");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .prefix("test-logs-".into())
             .suffix(".test.log".into())
@@ -1096,15 +1083,13 @@ mod tests {
             .exists());
 
         rotating_file.close().expect("able to close rotating file");
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn clean_up_existing_all() {
-        let root_dir = PathBuf::from("./target/tmp10");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .prefix("test-logs-".into())
             .suffix(".test.log".into())
@@ -1152,15 +1137,13 @@ mod tests {
         assert!(root_dir.join(timestamp3.clone() + ".log").exists());
 
         rotating_file.close().expect("able to close rotating file");
-
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn cut_file_works() {
-        let root_dir = PathBuf::from("./target/tmp11");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
@@ -1189,14 +1172,13 @@ mod tests {
         );
 
         rotating_file.close().expect("able to close rotating file");
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 
     #[test]
     #[serial(mock_time)]
     fn cut_file_compresses() {
-        let root_dir = PathBuf::from("./target/tmp12");
-        let _ = std::fs::remove_dir_all(&root_dir);
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path().to_owned();
         let timestamp = MOCK_WALL_CLOCK.current_timestamp_str();
         let mut rotating_file = RotatingFile::build(root_dir.clone())
             .size(1)
@@ -1232,6 +1214,5 @@ mod tests {
         );
 
         rotating_file.close().expect("able to close rotating file");
-        std::fs::remove_dir_all(root_dir).unwrap();
     }
 }
