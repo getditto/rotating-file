@@ -440,7 +440,13 @@ impl RotatingFile {
             let Some(to_remove) = file_history.pop_front() else {
                 break;
             };
-            if let Err(error) = std::fs::remove_file(&to_remove) {
+            if let Err(error) = std::fs::metadata(&to_remove).and_then(|meta| {
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(&to_remove)
+                } else {
+                    std::fs::remove_file(&to_remove)
+                }
+            }) {
                 error!("failed to remove completed file {:?}: {}", to_remove, error);
                 if fail_fast {
                     return Err(RotateError::Remove(to_remove, error));
