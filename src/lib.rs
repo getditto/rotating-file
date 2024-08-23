@@ -440,7 +440,13 @@ impl RotatingFile {
             let Some(to_remove) = file_history.pop_front() else {
                 break;
             };
-            if let Err(error) = std::fs::remove_file(&to_remove) {
+            if let Err(error) = std::fs::metadata(&to_remove).and_then(|meta| {
+                if meta.is_dir() {
+                    std::fs::remove_dir_all(&to_remove)
+                } else {
+                    std::fs::remove_file(&to_remove)
+                }
+            }) {
                 error!("failed to remove completed file {:?}: {}", to_remove, error);
                 if fail_fast {
                     return Err(RotateError::Remove(to_remove, error));
@@ -771,7 +777,7 @@ mod tests {
 
     use once_cell::sync::Lazy;
     use serial_test::serial;
-    use tempfile::tempdir;
+    use tempfile::{tempdir, tempdir_in};
 
     use super::*;
 
@@ -1214,5 +1220,30 @@ mod tests {
         );
 
         rotating_file.close().expect("able to close rotating file");
+    }
+
+    /// Regression test for getditto/ditto#14208, which identified that `RotatingFile` was unable to
+    /// ever rotate if a directory was created inside its root dir.
+    #[test]
+    fn can_rotate_with_nested_dirs() {
+        let root_dir_handle = tempdir().unwrap();
+        let root_dir = root_dir_handle.path();
+
+        let _nested_tempdir = tempdir_in(root_dir).expect("should be able to create a nested dir");
+
+        let mut rotating_file = RotatingFile::build(root_dir.to_owned())
+            .files(2, CleanupStrategy::All)
+            .compression(Compression::GZip)
+            .finish()
+            .expect("able to build rotating file");
+
+        write!(rotating_file, "a line in the file")
+            .expect("should be able to write to rotating file");
+
+        let mut guard = rotating_file.context.lock().unwrap();
+        let rotation_result = rotating_file.rotate(&mut guard, true);
+        drop(guard);
+
+        rotation_result.expect("rotation should not produce an error");
     }
 }
